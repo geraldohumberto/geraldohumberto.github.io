@@ -56,7 +56,10 @@
   }
   function select(id) {
     state.selected=id;const note=state.notes.find(n=>n.id===id);
-    renderNotes();if(!note){showPanel(state.pdf?'ocr':'intro');return;}
+    // Preserve the element under the pointer while starting a drag. Rebuilding
+    // the layer here would detach it before setPointerCapture can take effect.
+    layer.querySelectorAll('.annotation').forEach(el=>el.classList.toggle('selected',el.dataset.id===id));
+    if(!note){showPanel(state.pdf?'ocr':'intro');return;}
     showPanel('edit');$('textInput').value=note.text||'';$('textInput').disabled=note.type!=='text';
     $('fontSize').value=note.size||18;$('fontSize').disabled=note.type!=='text';
     $('textColor').value=note.color||'#1c293d';$('textColor').disabled=note.type!=='text';
@@ -66,12 +69,12 @@
     e.preventDefault();e.stopPropagation();select(note.id);
     const rect=layer.getBoundingClientRect(), x=e.clientX, y=e.clientY, initialX=note.x, initialY=note.y;
     el.setPointerCapture(e.pointerId);
-    el.onpointermove=move=>{note.x=Math.max(0,Math.min(.98,initialX+(move.clientX-x)/rect.width));note.y=Math.max(0,Math.min(.98,initialY+(move.clientY-y)/rect.height));el.style.left=(note.x*100)+'%';el.style.top=(note.y*100)+'%';};
-    el.onpointerup=()=>{el.onpointermove=null;el.onpointerup=null;};
+    el.onpointermove=move=>{note.x=Math.max(0,Math.min(1-el.offsetWidth/rect.width,initialX+(move.clientX-x)/rect.width));note.y=Math.max(0,Math.min(1-el.offsetHeight/rect.height,initialY+(move.clientY-y)/rect.height));el.style.left=(note.x*100)+'%';el.style.top=(note.y*100)+'%';};
+    el.onpointerup=el.onpointercancel=()=>{el.onpointermove=null;el.onpointerup=null;el.onpointercancel=null;};
   }
   function addNote(type, values={}) {
     const note={id:crypto.randomUUID(),page:state.page,type,x:.12,y:.16,text:'Novo texto',size:18,color:'#1c293d',width:.35,...values};
-    state.notes.push(note);select(note.id);toast(type==='text'?'Texto inserido. Digite no painel à direita.':'Imagem inserida. Arraste para posicionar.');
+    state.notes.push(note);renderNotes();select(note.id);toast(type==='text'?'Texto inserido. Digite no painel à direita.':'Imagem inserida. Arraste para posicionar.');
     if(type==='text') $('textInput').focus();
   }
   async function openPdf(file) {
