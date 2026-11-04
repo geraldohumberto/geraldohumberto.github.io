@@ -6,43 +6,17 @@
   const canvas = $('pdfCanvas'), surface = $('pageSurface'), layer = $('annotationLayer');
   let mupdfPromise;
   const loadMupdf = () => mupdfPromise ||= (window.PDFStudioMuPDF?Promise.resolve(window.PDFStudioMuPDF):import('https://cdn.jsdelivr.net/npm/mupdf@1.28.1/dist/mupdf.js')).catch(e=>{mupdfPromise=null;throw e;});
-  async function redactNative(notes){
+  async function rewriteNative(notes){
     const corrections=notes.filter(n=>n.type==='correction'&&n.sourceKey?.startsWith('native-'));
     if(!corrections.length)return null;
     const mupdf=await loadMupdf();
-    const doc=mupdf.Document.openDocument(state.bytes,'application/pdf');
-    for(const index of [...new Set(corrections.map(n=>n.page-1))]){
-      const page=doc.loadPage(index),bounds=page.getBounds(),W=bounds[2]-bounds[0],H=bounds[3]-bounds[1];
-      for(const n of corrections.filter(item=>item.page===index+1)){
-        for(const r of n.originalRects||[{x:n.x,y:n.y,w:n.w,h:n.h}]){
-          const annotation=page.createAnnotation('Redact');
-          annotation.setRect([bounds[0]+r.x*W,bounds[1]+r.y*H,bounds[0]+(r.x+r.w)*W,bounds[1]+(r.y+r.h)*H]);
-        }
-      }
-      page.applyRedactions(false,mupdf.PDFPage.REDACT_IMAGE_NONE,mupdf.PDFPage.REDACT_LINE_ART_NONE,mupdf.PDFPage.REDACT_TEXT_REMOVE);
-    }
-    return new Uint8Array(doc.saveToBuffer('garbage=4,compress').asUint8Array());
+    return window.PDFStudioStructural.edit(mupdf,state.bytes,corrections.map(n=>({page:n.page,original:n.originalText,text:n.text})));
   }
   async function rebuildPreview(){
     const run=++state.previewRun;
-    const bytes=await redactNative(state.notes);
+    const bytes=await rewriteNative(state.notes);
     if(run!==state.previewRun)return;
-    const corrections=state.notes.filter(n=>n.type==='correction');
-    let preview=null;
-    if(corrections.length){
-      const doc=await PDFLib.PDFDocument.load((bytes||state.bytes).slice());
-      const fonts=new Map();
-      for(let p=0;p<doc.getPageCount();p++){
-        const scanned=corrections.filter(n=>n.page===p+1&&n.sourceKey?.startsWith('scan-'));
-        const page=scanned.length?await replaceScannedPage(doc,p,scanned):doc.getPage(p);
-        for(const note of corrections.filter(n=>n.page===p+1)){
-          const font=await fontForNote(doc,note,fonts);
-          drawTextNote(page,note,font);
-        }
-      }
-      if(run!==state.previewRun)return;
-      preview=await pdfjsLib.getDocument({data:(await doc.save()).slice()}).promise;
-    }
+    const preview=bytes?await pdfjsLib.getDocument({data:bytes.slice()}).promise:null;
     if(run!==state.previewRun)return;
     state.previewPdf=preview;
     await render();
@@ -161,6 +135,7 @@
     $('inspectorTitle').textContent=({intro:'Comece por aqui',edit:'Editar elemento',ocr:'Texto reconhecido'})[name];
   };
   const setTool = tool => {
+    if(tool==='correct'&&state.pdf&&state.ocr[state.page-1]?.scanned){toast('Esta página é escaneada: não há texto original no PDF para editar.');return;}
     state.tool=tool;
     document.querySelectorAll('[data-tool]').forEach(el=>el.classList.toggle('active',el.dataset.tool===tool));
     layer.classList.toggle('tool-text',tool==='text');layer.classList.toggle('tool-correct',tool==='correct');
@@ -194,7 +169,6 @@
     if(run!==state.renderRun)return;
     await displayPage.render({canvasContext:canvas.getContext('2d'),viewport}).promise;
     if(run!==state.renderRun) return;
-    if(!state.previewPdf)patchScannedCanvas(canvas,state.notes.filter(n=>n.page===state.page&&n.type==='correction'&&n.sourceKey?.startsWith('scan-')));
     const content=await page.getTextContent();
     if(run!==state.renderRun) return;
     state.targets=groupTargets(content.items.map((item,i)=>{
@@ -211,34 +185,29 @@
     renderNotes();refreshOcr();
     updateControls();
   }
-  function patchScannedCanvas(target,notes){
-    if(!notes.length)return;
-    const ctx=target.getContext('2d');
-    for(const n of notes){ctx.fillStyle=n.bg;ctx.fillRect(n.x*target.width,n.y*target.height,n.w*target.width,n.h*target.height);}
-  }
   function renderNotes() {
     layer.replaceChildren();
     if(state.tool==='correct'){
-      const scanned=state.ocr[state.page-1];
-      const targets=[...state.targets,...(scanned?.scanned?scanned.words.map((w,i)=>({...w,key:`scan-${i}`,size:w.h*canvas.height/(1.45*state.zoom),h:w.h,font:'regular',align:'left'})):[])];
+      const targets=state.targets;
       for(const target of targets){
         if(state.notes.some(n=>n.page===state.page&&(n.sourceKeys||[n.sourceKey]).includes(target.key)))continue;
         const hit=document.createElement('div');hit.className='text-target';hit.title=`Corrigir: ${target.text}`;
         hit.style.left=(target.x*100)+'%';hit.style.top=(target.y*100)+'%';hit.style.width=(Math.min(1-target.x,target.w)*100)+'%';hit.style.height=(target.h*100)+'%';
         hit.onclick=async e=>{
           e.stopPropagation();const style=sampleStyle(target.x,target.y,target.w,target.h);
-          if(target.key.startsWith('native-')){
-            try{style.color=await originalTextColor(state.page,target.originalRects||[{x:target.x,y:target.y,w:target.w,h:target.h}])||style.color;}
-            catch(error){console.warn('Cor original indisponível; usando cor estimada.',error);}
-          }
+          try{
+            const mupdf=await loadMupdf();
+            window.PDFStudioStructural.inspect(mupdf,state.bytes,state.page-1,target.text);
+            style.color=await originalTextColor(state.page,target.originalRects||[{x:target.x,y:target.y,w:target.w,h:target.h}])||style.color;
+          }catch(error){toast(error.message||'Este trecho não permite edição original segura.');return;}
           const neighbor=state.targets.filter(t=>t!==target&&t.x>target.x+target.w*.5&&t.y<target.y+target.h+.015&&t.y+t.h>target.y-.015).sort((a,b)=>a.x-b.x)[0];
           const available=(neighbor?.x??.93)-target.x-.015;
           const width=target.originalRects?.length>1?Math.max(target.w+.025,available):Math.max(target.w+.025,.2);
-          setTool('select');const note=addNote('correction',{x:target.x,y:target.y,w:Math.min(1-target.x,width),h:target.h,text:target.text,size:clamp(target.size,6,96),sourceKey:target.key,sourceKeys:target.sourceKeys||[target.key],originalRects:target.originalRects,font:target.font,bold:target.bold,align:target.align,...style});
+          setTool('select');const note=addNote('correction',{x:target.x,y:target.y,w:Math.min(1-target.x,width),h:target.h,text:target.text,originalText:target.text,size:clamp(target.size,6,96),sourceKey:target.key,sourceKeys:target.sourceKeys||[target.key],originalRects:target.originalRects,font:target.font,bold:target.bold,align:target.align,...style});
           try{
-            setHint(target.key.startsWith('native-')?'Removendo o texto original do PDF...':'Reconstruindo o trecho reconhecido por OCR...');
+            setHint('Preparando a edição do fluxo de texto original...');
             await rebuildPreview();beginInlineEdit(note);setHint('Edite o texto no documento e clique em Aplicar alterações');
-          }catch(error){console.error(error);state.notes=state.notes.filter(n=>n.id!==note.id);state.selected=null;renderNotes();toast('Não foi possível preparar a edição real deste trecho. O original foi preservado.');}
+          }catch(error){console.error(error);state.notes=state.notes.filter(n=>n.id!==note.id);state.selected=null;renderNotes();toast(error.message||'Não foi possível editar este trecho original.');}
         };
         layer.append(hit);
       }
@@ -265,11 +234,11 @@
     layer.querySelectorAll('.annotation').forEach(el=>el.classList.toggle('selected',el.dataset.id===id));renderObjectList();
     if(!note){showPanel(state.pdf?'ocr':'intro');return;}
     showPanel('edit');$('textInput').value=note.text||'';$('textInput').disabled=note.type==='image';
-    $('fontSize').value=note.size||18;$('fontSize').disabled=note.type==='image';
-    $('textColor').value=note.color||'#1c293d';$('textColor').disabled=note.type==='image';
-    $('chooseFont').disabled=note.type==='image';$('fontName').textContent=note.fontKey?(state.fonts.get(note.fontKey)?.name||'Fonte local'):'Fonte similar à original';
-    $('imageWidth').value=Math.round((note.type==='correction'?note.w:note.width||.35)*100);$('imageWidth').disabled=!['image','correction'].includes(note.type);
-    $('widthLabel').textContent=note.type==='correction'?'LARGURA DO PARÁGRAFO':'LARGURA DA IMAGEM';
+    $('fontSize').value=note.size||18;$('fontSize').disabled=note.type==='image'||note.type==='correction';
+    $('textColor').value=note.color||'#1c293d';$('textColor').disabled=note.type==='image'||note.type==='correction';
+    $('chooseFont').disabled=note.type==='image'||note.type==='correction';$('fontName').textContent=note.type==='correction'?'Fonte original preservada':note.fontKey?(state.fonts.get(note.fontKey)?.name||'Fonte local'):'Fonte similar à original';
+    $('imageWidth').value=Math.round((note.type==='correction'?note.w:note.width||.35)*100);$('imageWidth').disabled=note.type!=='image';
+    $('widthLabel').textContent='LARGURA DA IMAGEM';$('widthLabel').hidden=note.type==='correction';$('imageWidth').hidden=note.type==='correction';
   }
   function startDrag(e,note,el) {
     e.preventDefault();e.stopPropagation();select(note.id);
@@ -305,7 +274,7 @@
     editor.oninput=()=>{note.text=editor.value;$('textInput').value=note.text;editor.style.fontSize=(effectiveSize(note)*state.zoom*1.45)+'px';editor.style.height=Math.max(28,editor.scrollHeight+4)+'px';setPending();};
     editor.onkeydown=e=>{if(e.key==='Escape'){note.text=initial;editor.blur();}if(e.key==='Enter'&&(e.ctrlKey||e.metaKey)){e.preventDefault();editor.blur();}};
     const initial=note.text;
-    editor.onblur=()=>{editor.remove();if(!note.text.trim()&&note.type==='text'){state.notes=state.notes.filter(n=>n.id!==note.id);if(state.selected===note.id)state.selected=null;}renderNotes();refreshOcr();if(note.type==='correction')rebuildPreview().catch(error=>{console.error(error);toast('Não foi possível atualizar a prévia do PDF.');});};
+    editor.onblur=()=>{editor.remove();if(!note.text.trim()&&note.type==='text'){state.notes=state.notes.filter(n=>n.id!==note.id);if(state.selected===note.id)state.selected=null;}renderNotes();refreshOcr();if(note.type==='correction')rebuildPreview().catch(error=>{console.error(error);toast(error.message||'Não foi possível editar o texto original.');});};
     layer.append(editor);editor.focus();editor.select();
   }
   async function openPdf(file) {
@@ -353,25 +322,6 @@
     finally{if(worker) await worker.terminate();}
   }
   function cleanPdfText(s){return String(s).replace(/[^\x20-\x7e\xa0-\xff]/g,'?');}
-  function wrapPdfLines(text,font,size,maxWidth){
-    const result=[];
-    for(const paragraph of String(text).split('\n')){
-      let line='';
-      for(const word of paragraph.trim().split(/\s+/).filter(Boolean)){
-        const next=line?line+' '+word:word;
-        if(font.widthOfTextAtSize(next,size)<=maxWidth){line=next;continue;}
-        if(line){result.push(line);line='';}
-        let piece='';
-        for(const char of word){
-          if(piece&&font.widthOfTextAtSize(piece+char,size)>maxWidth){result.push(piece);piece='';}
-          piece+=char;
-        }
-        line=piece;
-      }
-      result.push(line);
-    }
-    return result;
-  }
   async function fontForNote(doc,note,fonts){
     const key=note.fontKey||`${note.font||'helvetica'}:${!!note.bold}`;
     if(!fonts.has(key)){
@@ -390,40 +340,29 @@
   }
   function drawTextNote(page,note,font){
     const {width:W,height:H}=page.getSize(),size=clamp(+note.size||18,6,96);
-    const lines=note.type==='correction'?wrapPdfLines(note.fontKey?note.text:cleanPdfText(note.text),font,size,Math.max(10,note.w*W-4)):note.text.split('\n');
+    const lines=note.text.split('\n');
     lines.forEach((line,i)=>{
       if(!line)return;
-      const cleaned=note.fontKey?line:cleanPdfText(line),lineWidth=font.widthOfTextAtSize(cleaned,size);
-      const alignOffset=note.type==='correction'?(note.align==='center'?(note.w*W-lineWidth)/2:note.align==='right'?note.w*W-lineWidth:0):0;
+      const cleaned=note.fontKey?line:cleanPdfText(line);
       const y=H-note.y*H-size-i*size*1.1;
-      if(y<0)throw new Error('O parágrafo excede o limite da página. Aumente a largura ou reduza a fonte.');
-      page.drawText(cleaned,{x:clamp(note.x*W+alignOffset,0,W-1),y,size,font,color:rgbColor(note.color)});
+      if(y<0)throw new Error('O texto excede o limite da página.');
+      page.drawText(cleaned,{x:clamp(note.x*W,0,W-1),y,size,font,color:rgbColor(note.color)});
     });
-  }
-  async function replaceScannedPage(doc,index,notes){
-    const source=await state.pdf.getPage(index+1),viewport=source.getViewport({scale:2});
-    const c=document.createElement('canvas');c.width=Math.ceil(viewport.width);c.height=Math.ceil(viewport.height);
-    await source.render({canvasContext:c.getContext('2d'),viewport}).promise;
-    patchScannedCanvas(c,notes);
-    const pngBytes=await (await fetch(c.toDataURL('image/png'))).arrayBuffer();
-    const old=doc.getPage(index),{width,height}=old.getSize();
-    doc.removePage(index);const page=doc.insertPage(index,[width,height]);
-    const image=await doc.embedPng(pngBytes);page.drawImage(image,{x:0,y:0,width,height});
-    c.width=0;c.height=0;
-    return page;
   }
   async function exportPdf() {
     if(!state.pdf||state.busy)return;
     if(state.pending){toast('Clique em Aplicar alterações antes de baixar.');return;}
     state.busy=true;updateControls();setHint('Preparando o PDF...');
     try{
-      const nativeBytes=await redactNative(state.committed);
+      const nativeBytes=await rewriteNative(state.committed);
+      if(nativeBytes&&state.committed.every(n=>n.type==='correction')){
+        downloadPdf(nativeBytes);toast('PDF com texto original editado baixado com sucesso.');return;
+      }
       const doc=await PDFLib.PDFDocument.load((nativeBytes||state.bytes).slice(),{ignoreEncryption:false});
       const font=await doc.embedFont(PDFLib.StandardFonts.Helvetica);
       const embeddedFonts=new Map();
       for(let p=0;p<doc.getPageCount();p++){
-        const scanCorrections=state.committed.filter(n=>n.page===p+1&&n.type==='correction'&&n.sourceKey?.startsWith('scan-'));
-        const page=scanCorrections.length?await replaceScannedPage(doc,p,scanCorrections):doc.getPage(p);
+        const page=doc.getPage(p);
         const {width:W,height:H}=page.getSize(),data=state.ocr[p];
         if(data?.scanned&&data.words.length){
           for(const [i,w] of data.words.entries()){
@@ -434,25 +373,26 @@
           }
         }
         for(const note of state.committed.filter(n=>n.page===p+1)){
-          if(note.type==='text'||note.type==='correction'){
+          if(note.type==='text'){
             const textFont=await fontForNote(doc,note,embeddedFonts);
             drawTextNote(page,note,textFont);
-          } else {
+          } else if(note.type==='image') {
             const imageBytes=await (await fetch(note.src)).arrayBuffer();const image=note.mime==='image/png'?await doc.embedPng(imageBytes):await doc.embedJpg(imageBytes);
             const width=note.width*W,height=width*image.height/image.width;
             page.drawImage(image,{x:note.x*W,y:H-note.y*H-height,width,height});
           }
         }
       }
-      const bytes=await doc.save();const url=URL.createObjectURL(new Blob([bytes],{type:'application/pdf'}));
-      const a=document.createElement('a');a.href=url;a.download=state.name.replace(/\.pdf$/i,'')+'-editado.pdf';a.click();setTimeout(()=>URL.revokeObjectURL(url),60000);
+      downloadPdf(await doc.save());
       toast('PDF editado baixado com sucesso.');
-    }catch(error){console.error(error);toast(error.message?.includes('parágrafo excede')?error.message:'Não foi possível salvar o PDF. Confira as imagens e tente novamente.');}
+    }catch(error){console.error(error);toast(error.message||'Não foi possível salvar o PDF.');}
     finally{state.busy=false;updateControls();setHint('Arraste textos e imagens para posicionar');}
   }
-  function applyChanges(){
+  function downloadPdf(bytes){const url=URL.createObjectURL(new Blob([bytes],{type:'application/pdf'}));const a=document.createElement('a');a.href=url;a.download=state.name.replace(/\.pdf$/i,'')+'-editado.pdf';a.click();setTimeout(()=>URL.revokeObjectURL(url),60000);}
+  async function applyChanges(){
     layer.querySelector('.inline-editor')?.blur();
     if(!state.pending)return;
+    try{await rewriteNative(state.notes);}catch(error){console.error(error);toast(error.message||'Este trecho não permite edição original.');return;}
     state.committed=clone(state.notes);state.pending=false;updateControls();refreshOcr();
     toast('Alterações aplicadas. Confira o documento e depois baixe o PDF.');
   }
@@ -480,7 +420,7 @@
       URL.revokeObjectURL(url);addNote('image',{src,mime,width:.35});setTool('select');
     }catch(error){console.error(error);toast('Não foi possível inserir esta imagem.');}
   };
-  const refreshCorrection=n=>{if(n?.type==='correction')rebuildPreview().catch(error=>{console.error(error);toast('Não foi possível atualizar a prévia do PDF.');});};
+  const refreshCorrection=n=>{if(n?.type==='correction')rebuildPreview().catch(error=>{console.error(error);toast(error.message||'Não foi possível editar o texto original.');});};
   $('textInput').oninput=e=>{const n=state.notes.find(n=>n.id===state.selected);if(n){n.text=e.target.value;renderNotes();setPending();refreshCorrection(n);}};
   $('fontSize').oninput=e=>{const n=state.notes.find(n=>n.id===state.selected);if(n){n.size=+e.target.value;renderNotes();setPending();refreshCorrection(n);}};
   $('textColor').oninput=e=>{const n=state.notes.find(n=>n.id===state.selected);if(n){n.color=e.target.value;renderNotes();setPending();refreshCorrection(n);}};
@@ -505,7 +445,7 @@
   document.addEventListener('dragover',e=>{if([...e.dataTransfer?.types||[]].includes('Files'))e.preventDefault();});
   document.addEventListener('dragleave',e=>{e.preventDefault();if(--depth<=0){depth=0;$('dropOverlay').classList.add('hidden');}});
   document.addEventListener('drop',e=>{e.preventDefault();depth=0;$('dropOverlay').classList.add('hidden');openPdf([...e.dataTransfer.files].find(f=>/\.pdf$/i.test(f.name)||f.type==='application/pdf'));});
-  if(!window.pdfjsLib||!window.PDFLib||!window.Tesseract){setHint('Falha ao carregar bibliotecas. Verifique a conexão e recarregue.');toast('Não foi possível iniciar o editor. Verifique sua conexão.');}
+    if(!window.pdfjsLib||!window.PDFLib||!window.Tesseract||!window.PDFStudioStructural){setHint('Falha ao carregar bibliotecas. Verifique a conexão e recarregue.');toast('Não foi possível iniciar o editor. Verifique sua conexão.');}
   else pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
   updateControls();
 })();
