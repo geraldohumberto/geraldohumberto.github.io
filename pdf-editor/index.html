@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101a2b">
+  <title>PDF Studio · Editor com OCR</title>
+  <link rel="stylesheet" href="./style.css">
+  <script defer src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
+  <script defer src="./app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="brand-icon">P<span>✦</span></span><div><strong>PDF Studio</strong><small>Seu espaço de edição</small></div></div>
+    <span class="top-divider"></span><span id="fileName" class="file-name">Nenhum documento aberto</span>
+    <div class="top-actions"><span class="private-pill">◈ &nbsp;Processamento no navegador</span><button id="openTop" class="btn ghost">Abrir PDF</button><button id="saveTop" class="btn primary" disabled>↓ &nbsp;Baixar PDF</button></div>
+  </header>
+
+  <main class="layout">
+    <aside class="rail" aria-label="Ferramentas de edição">
+      <button class="rail-btn active" data-tool="select" title="Selecionar e mover"><span>⌖</span><small>Selecionar</small></button>
+      <button class="rail-btn" data-tool="text" title="Inserir texto"><span>T</span><small>Texto</small></button>
+      <button class="rail-btn" data-tool="image" title="Inserir imagem"><span>▧</span><small>Imagem</small></button>
+      <div class="rail-separator"></div>
+      <button class="rail-btn" id="ocrTab" title="Texto reconhecido"><span>▤</span><small>OCR</small></button>
+    </aside>
+
+    <section class="workspace">
+      <div class="work-toolbar"><div class="toolbar-left"><span class="eyebrow">ÁREA DE TRABALHO</span><span id="workHint" class="hint">Abra um PDF para começar</span></div><div class="toolbar-right"><button id="prevPage" class="icon-btn" disabled aria-label="Página anterior">‹</button><span id="pageCounter">— / —</span><button id="nextPage" class="icon-btn" disabled aria-label="Próxima página">›</button><span class="toolbar-rule"></span><button id="zoomOut" class="icon-btn" disabled aria-label="Diminuir zoom">−</button><span id="zoomLabel">100%</span><button id="zoomIn" class="icon-btn" disabled aria-label="Aumentar zoom">+</button></div></div>
+
+      <div id="emptyState" class="empty-state"><div class="empty-card"><div class="empty-art"><div class="paper paper-back"></div><div class="paper paper-front"><span class="paper-line wide"></span><span class="paper-line"></span><span class="paper-line short"></span><div class="sparkle">✦</div></div></div><div class="eyebrow">O SEU DOCUMENTO, DO SEU JEITO</div><h1>Edite PDFs com<br><em>liberdade.</em></h1><p>Escreva, adicione imagens e encontre texto em documentos digitalizados com OCR automático.</p><button id="openEmpty" class="btn primary large">＋ &nbsp;Escolher um PDF</button><p class="drop-note">ou arraste seu PDF para esta janela</p></div></div>
+      <div id="documentArea" class="document-area hidden"><div id="pageSurface" class="page-surface"><canvas id="pdfCanvas"></canvas><div id="annotationLayer" class="annotation-layer"></div></div></div>
+      <div id="dropOverlay" class="drop-overlay hidden">Solte seu PDF para abrir</div>
+    </section>
+
+    <aside class="inspector">
+      <div class="inspector-head"><span class="eyebrow">PAINEL</span><h2 id="inspectorTitle">Comece por aqui</h2></div>
+      <div id="introPanel" class="panel-content"><div class="feature-row"><span class="feature-icon blue">T</span><div><strong>Escreva no documento</strong><p>Posicione textos onde quiser.</p></div></div><div class="feature-row"><span class="feature-icon violet">▧</span><div><strong>Adicione imagens</strong><p>Inclua fotos, assinaturas e logos.</p></div></div><div class="feature-row"><span class="feature-icon green">◎</span><div><strong>OCR automático</strong><p>Reconheça texto de páginas escaneadas.</p></div></div><div class="note-box">Os arquivos são processados no seu navegador. Ao baixar, você recebe uma nova cópia do PDF.</div></div>
+      <div id="editPanel" class="panel-content hidden"><label class="field-label" for="textInput">TEXTO</label><textarea id="textInput" rows="5" placeholder="Digite aqui..."></textarea><div class="field-grid"><div><label class="field-label" for="fontSize">TAMANHO</label><input id="fontSize" type="number" min="6" max="96" value="18"></div><div><label class="field-label" for="textColor">COR</label><input id="textColor" type="color" value="#1c293d"></div></div><label class="field-label" for="imageWidth">LARGURA DA IMAGEM</label><input id="imageWidth" type="range" min="5" max="95" value="35"><div class="panel-actions"><button id="deleteItem" class="btn danger">Remover elemento</button></div><p class="microcopy">Arraste o elemento na página para reposicionar. Use o controle acima para redimensionar imagens.</p></div>
+      <div id="ocrPanel" class="panel-content hidden"><div class="ocr-status"><span class="status-dot"></span><strong id="ocrState">OCR ativado</strong></div><p id="ocrInfo" class="microcopy">O reconhecimento começa automaticamente ao abrir o PDF. Páginas com texto original usam o próprio texto.</p><div class="progress-track"><div id="ocrProgress" class="progress-fill"></div></div><label class="field-label" for="ocrText">TEXTO DA PÁGINA ATUAL</label><textarea id="ocrText" rows="14" placeholder="O texto reconhecido aparecerá aqui..."></textarea><button id="copyOcr" class="btn secondary full">Copiar texto desta página</button><button id="downloadTxt" class="btn ghost full">Baixar texto de todas as páginas</button><p class="microcopy">Em páginas escaneadas, a cópia exportada também recebe uma camada de texto pesquisável. Revise o OCR antes de usar informações importantes.</p></div>
+      <div class="inspector-footer"><span class="status-dot"></span> OCR ligado por padrão <span class="foot-spark">✦</span></div>
+    </aside>
+  </main>
+  <input id="pdfInput" type="file" accept="application/pdf,.pdf" hidden><input id="imageInput" type="file" accept="image/png,image/jpeg,image/webp" hidden>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+</body>
+</html>
