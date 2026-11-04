@@ -5,11 +5,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#101a2b">
   <title>PDF Studio · Editor com OCR</title>
-  <link rel="stylesheet" href="./style.css?v=review-2">
+  <link rel="stylesheet" href="./style.css?v=native-1">
   <script defer src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
   <script defer src="https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/@pdf-lib/fontkit@1.1.1/dist/fontkit.umd.min.js"></script>
   <script defer src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
-  <script defer src="./app.js?v=review-2"></script>
+  <script defer src="./app.js?v=native-1"></script>
 </head>
 <body>
   <header class="topbar">
@@ -39,13 +40,13 @@
     <aside class="inspector">
       <div class="inspector-head"><span class="eyebrow">PAINEL</span><h2 id="inspectorTitle">Comece por aqui</h2></div>
       <div id="introPanel" class="panel-content"><div class="feature-row"><span class="feature-icon blue">T</span><div><strong>Escreva no documento</strong><p>Clique na página e digite no próprio lugar.</p></div></div><div class="feature-row"><span class="feature-icon blue">✎</span><div><strong>Corrija textos</strong><p>Selecione Corrigir e clique no texto original.</p></div></div><div class="feature-row"><span class="feature-icon violet">▧</span><div><strong>Adicione imagens</strong><p>Inclua fotos, assinaturas e logos.</p></div></div><div class="feature-row"><span class="feature-icon green">◎</span><div><strong>OCR automático</strong><p>Reconheça texto de páginas escaneadas.</p></div></div><div class="note-box">Os arquivos são processados no seu navegador. Ao baixar, você recebe uma nova cópia do PDF.</div></div>
-      <div id="editPanel" class="panel-content hidden"><label class="field-label" for="textInput">TEXTO</label><textarea id="textInput" rows="5" placeholder="Digite aqui..."></textarea><div class="field-grid"><div><label class="field-label" for="fontSize">TAMANHO</label><input id="fontSize" type="number" min="6" max="96" value="18"></div><div><label class="field-label" for="textColor">COR</label><input id="textColor" type="color" value="#1c293d"></div></div><label class="field-label" for="imageWidth">LARGURA DA IMAGEM</label><input id="imageWidth" type="range" min="5" max="95" value="35"><div class="panel-actions"><button id="deleteItem" class="btn danger">Remover este elemento</button></div><p class="microcopy">Selecione uma imagem na página ou na lista abaixo e remova qualquer uma, em qualquer ordem. Após editar, clique em Aplicar alterações antes de baixar.</p><p class="microcopy">Em PDFs com texto selecionável, a correção visual pode manter o texto antigo na estrutura interna.</p></div>
+      <div id="editPanel" class="panel-content hidden"><label class="field-label" for="textInput">TEXTO</label><textarea id="textInput" rows="5" placeholder="Digite aqui..."></textarea><div class="field-grid"><div><label class="field-label" for="fontSize">TAMANHO</label><input id="fontSize" type="number" min="6" max="96" value="18"></div><div><label class="field-label" for="textColor">COR</label><input id="textColor" type="color" value="#1c293d"></div></div><label class="field-label" for="chooseFont">FONTE DO TEXTO</label><button id="chooseFont" class="btn ghost full" type="button">Usar fonte do meu computador (.ttf/.otf)</button><p id="fontName" class="microcopy">Fonte similar à original</p><label class="field-label" for="imageWidth">LARGURA DA IMAGEM</label><input id="imageWidth" type="range" min="5" max="95" value="35"><div class="panel-actions"><button id="deleteItem" class="btn danger">Remover este elemento</button></div><p class="microcopy">Para texto nativo, Corrigir remove o trecho original do conteúdo do PDF e insere o novo texto. Fontes incorporadas em subconjunto podem não conter as novas letras; escolha uma fonte local quando precisar de correspondência melhor.</p><p class="microcopy">Em escaneamentos, o OCR reconstrói os pixels do trecho. Fundos detalhados e disposição complexa podem exigir ajustes manuais na prévia.</p></div>
       <div id="ocrPanel" class="panel-content hidden"><div class="ocr-status"><span class="status-dot"></span><strong id="ocrState">OCR ativado</strong></div><p id="ocrInfo" class="microcopy">O reconhecimento começa automaticamente ao abrir o PDF. O texto abaixo acompanha as correções feitas na página; para alterá-lo, use Corrigir sobre o documento.</p><div class="progress-track"><div id="ocrProgress" class="progress-fill"></div></div><label class="field-label" for="ocrText">TEXTO DA PÁGINA ATUAL · LEITURA</label><textarea id="ocrText" rows="12" readonly placeholder="O texto reconhecido aparecerá aqui..."></textarea><button id="copyOcr" class="btn secondary full">Copiar texto desta página</button><button id="downloadTxt" class="btn ghost full">Baixar texto de todas as páginas</button><p class="microcopy">Em páginas escaneadas, a cópia exportada recebe uma camada de texto pesquisável. Revise o OCR antes de usar informações importantes.</p></div>
       <div id="objectPanel" class="object-panel hidden"><strong>Elementos do documento</strong><div id="objectList"></div></div>
-      <div class="inspector-footer"><span class="status-dot"></span> OCR ligado por padrão <span class="foot-spark">✦</span></div>
+      <div class="inspector-footer"><span class="status-dot"></span> OCR ligado por padrão <a href="./LICENSE" target="_blank" rel="noopener">Licença AGPL</a><span class="foot-spark">✦</span></div>
     </aside>
   </main>
-  <input id="pdfInput" type="file" accept="application/pdf,.pdf" hidden><input id="imageInput" type="file" accept="image/png,image/jpeg,image/webp" hidden>
+  <input id="pdfInput" type="file" accept="application/pdf,.pdf" hidden><input id="imageInput" type="file" accept="image/png,image/jpeg,image/webp" hidden><input id="fontInput" type="file" accept=".ttf,.otf,font/ttf,font/otf" hidden>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
 </body>
 </html>
