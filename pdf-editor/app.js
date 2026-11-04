@@ -2,8 +2,34 @@
 (() => {
   'use strict';
   const $ = id => document.getElementById(id);
-  const state = { bytes:null, pdf:null, name:'', page:1, zoom:1, tool:'select', notes:[], committed:[], pending:false, selected:null, targets:[], ocr:[], ocrRun:0, busy:false, renderRun:0 };
+  const state = { bytes:null, pdf:null, previewPdf:null, previewRun:0, name:'', page:1, zoom:1, tool:'select', notes:[], committed:[], fonts:new Map(), pending:false, selected:null, targets:[], ocr:[], ocrRun:0, busy:false, renderRun:0 };
   const canvas = $('pdfCanvas'), surface = $('pageSurface'), layer = $('annotationLayer');
+  let mupdfPromise;
+  const loadMupdf = () => mupdfPromise ||= (window.PDFStudioMuPDF?Promise.resolve(window.PDFStudioMuPDF):import('https://cdn.jsdelivr.net/npm/mupdf@1.28.1/dist/mupdf.js')).catch(e=>{mupdfPromise=null;throw e;});
+  async function redactNative(notes){
+    const corrections=notes.filter(n=>n.type==='correction'&&n.sourceKey?.startsWith('native-'));
+    if(!corrections.length)return null;
+    const mupdf=await loadMupdf();
+    const doc=mupdf.Document.openDocument(state.bytes,'application/pdf');
+    for(const index of [...new Set(corrections.map(n=>n.page-1))]){
+      const page=doc.loadPage(index),bounds=page.getBounds(),W=bounds[2]-bounds[0],H=bounds[3]-bounds[1];
+      for(const n of corrections.filter(item=>item.page===index+1)){
+        const annotation=page.createAnnotation('Redact');
+        annotation.setRect([bounds[0]+n.x*W,bounds[1]+n.y*H,bounds[0]+(n.x+n.w)*W,bounds[1]+(n.y+n.h)*H]);
+      }
+      page.applyRedactions(false,mupdf.PDFPage.REDACT_IMAGE_NONE,mupdf.PDFPage.REDACT_LINE_ART_NONE,mupdf.PDFPage.REDACT_TEXT_REMOVE);
+    }
+    return new Uint8Array(doc.saveToBuffer('garbage=4,compress').asUint8Array());
+  }
+  async function rebuildPreview(){
+    const run=++state.previewRun;
+    const bytes=await redactNative(state.notes);
+    if(run!==state.previewRun)return;
+    const preview=bytes?await pdfjsLib.getDocument({data:bytes.slice()}).promise:null;
+    if(run!==state.previewRun)return;
+    state.previewPdf=preview;
+    await render();
+  }
   const toast = message => { const el=$('toast'); el.textContent=message; el.classList.add('show'); clearTimeout(toast.timer); toast.timer=setTimeout(()=>el.classList.remove('show'),3500); };
   const clone = notes => notes.map(n=>({...n}));
   const clamp = (v,min,max) => Math.max(min,Math.min(max,v));
@@ -34,7 +60,7 @@
   function effectiveSize(note){
     let size=clamp(+note.size||18,6,96);
     if(note.type!=='correction')return size;
-    const measure=canvas.getContext('2d');measure.font=`${size*1.45*state.zoom}px Arial`;
+    const measure=canvas.getContext('2d');measure.font=`${size*1.45*state.zoom}px ${note.previewFamily||'Arial'}`;
     const max=Math.max(14,note.w*canvas.width+18*state.zoom);
     const wide=Math.max(1,...(note.text||'').split('\n').map(line=>measure.measureText(line).width));
     return clamp(size*Math.min(1,max/wide),6,size);
@@ -76,10 +102,11 @@
   }
   function removeNote(id){
     layer.querySelector('.inline-editor')?.blur();
-    const count=state.notes.length;state.notes=state.notes.filter(n=>n.id!==id);
+    const removed=state.notes.find(n=>n.id===id),count=state.notes.length;state.notes=state.notes.filter(n=>n.id!==id);
     if(state.notes.length===count)return;
     if(state.selected===id)select(null);
     renderNotes();setPending();toast('Elemento removido. Clique em Aplicar alterações para confirmar.');
+    if(removed?.type==='correction')rebuildPreview().catch(error=>{console.error(error);toast('Não foi possível atualizar a prévia.');});
   }
   const setHint = s => $('workHint').textContent=s;
   const setStatus = s => $('ocrState').textContent=s;
@@ -117,8 +144,11 @@
     if(run!==state.renderRun) return;
     canvas.width=Math.ceil(viewport.width);canvas.height=Math.ceil(viewport.height);
     surface.style.width=canvas.width+'px';surface.style.height=canvas.height+'px';
-    await page.render({canvasContext:canvas.getContext('2d'),viewport}).promise;
+    const displayPage=state.previewPdf?await state.previewPdf.getPage(state.page):page;
+    if(run!==state.renderRun)return;
+    await displayPage.render({canvasContext:canvas.getContext('2d'),viewport}).promise;
     if(run!==state.renderRun) return;
+    patchScannedCanvas(canvas,state.notes.filter(n=>n.page===state.page&&n.type==='correction'&&n.sourceKey?.startsWith('scan-')));
     const content=await page.getTextContent();
     if(run!==state.renderRun) return;
     state.targets=groupTargets(content.items.map((item,i)=>{
@@ -127,10 +157,18 @@
       if(Math.abs(t[1])>1||!px)return null;
       const top=t[5]-px*.88;
       const x=clamp(t[4]/viewport.width,0,1),w=clamp(Math.max(12,item.width*viewport.scale)/viewport.width,.01,1-x);
-      return {key:`native-${i}`,text:item.str,x,y:clamp(top/viewport.height,0,1),w,h:px*1.15/viewport.height,size:px/viewport.scale,font:/bold/i.test(item.fontName||'')?'bold':'regular',align:Math.abs(x+w/2-.5)<.045?'center':'left'};
+      const family=content.styles?.[item.fontName]?.fontFamily||'';
+      const font=/courier|mono/i.test(family)?'courier':/times|georgia/i.test(family)||(/serif/i.test(family)&&!/sans.serif/i.test(family))?'times':'helvetica';
+      const bold=/bold|black|heavy/i.test(item.fontName+' '+family);
+      return {key:`native-${i}`,text:item.str,x,y:clamp(top/viewport.height,0,1),w,h:px*1.15/viewport.height,size:px/viewport.scale,font,bold,align:Math.abs(x+w/2-.5)<.045?'center':'left'};
     }).filter(Boolean));
     renderNotes();refreshOcr();
     updateControls();
+  }
+  function patchScannedCanvas(target,notes){
+    if(!notes.length)return;
+    const ctx=target.getContext('2d');
+    for(const n of notes){ctx.fillStyle=n.bg;ctx.fillRect(n.x*target.width,n.y*target.height,n.w*target.width,n.h*target.height);}
   }
   function renderNotes() {
     layer.replaceChildren();
@@ -141,7 +179,14 @@
         if(state.notes.some(n=>n.page===state.page&&(n.sourceKeys||[n.sourceKey]).includes(target.key)))continue;
         const hit=document.createElement('div');hit.className='text-target';hit.title=`Corrigir: ${target.text}`;
         hit.style.left=(target.x*100)+'%';hit.style.top=(target.y*100)+'%';hit.style.width=(Math.min(1-target.x,target.w)*100)+'%';hit.style.height=(target.h*100)+'%';
-        hit.onclick=e=>{e.stopPropagation();const style=sampleStyle(target.x,target.y,target.w,target.h);setTool('select');const note=addNote('correction',{x:target.x,y:target.y,w:Math.min(1-target.x,target.w),h:target.h,text:target.text,size:clamp(target.size,6,96),sourceKey:target.key,sourceKeys:target.sourceKeys||[target.key],font:target.font,align:target.align,...style});beginInlineEdit(note);};
+        hit.onclick=async e=>{
+          e.stopPropagation();const style=sampleStyle(target.x,target.y,target.w,target.h);
+          setTool('select');const note=addNote('correction',{x:target.x,y:target.y,w:Math.min(1-target.x,target.w),h:target.h,text:target.text,size:clamp(target.size,6,96),sourceKey:target.key,sourceKeys:target.sourceKeys||[target.key],font:target.font,align:target.align,...style});
+          try{
+            setHint(target.key.startsWith('native-')?'Removendo o texto original do PDF...':'Reconstruindo o trecho reconhecido por OCR...');
+            await rebuildPreview();beginInlineEdit(note);setHint('Edite o texto no documento e clique em Aplicar alterações');
+          }catch(error){console.error(error);state.notes=state.notes.filter(n=>n.id!==note.id);state.selected=null;renderNotes();toast('Não foi possível preparar a edição real deste trecho. O original foi preservado.');}
+        };
         layer.append(hit);
       }
     }
@@ -150,10 +195,10 @@
       el.style.left=(note.x*100)+'%';el.style.top=(note.y*100)+'%';el.dataset.id=note.id;
       if(note.type==='text'||note.type==='correction') {
         el.textContent=note.text||'Digite aqui';el.style.fontSize=(effectiveSize(note)*state.zoom*1.45)+'px';el.style.color=note.color;
-        el.style.setProperty('--document-fg',note.color);el.style.setProperty('--document-bg',note.type==='correction'?(note.bg||'transparent'):'transparent');
-        el.style.fontWeight=note.font==='bold'?'700':'400';el.style.textAlign=note.align||'left';
+        el.style.setProperty('--document-fg',note.color);el.style.setProperty('--document-bg','transparent');
+        el.style.fontWeight=note.bold?'700':'400';el.style.fontFamily=note.previewFamily||(note.font==='times'?'Times New Roman':note.font==='courier'?'Courier New':'Arial');el.style.textAlign=note.align||'left';
         el.style.maxWidth=`${Math.max(2,(1-note.x)*100)}%`;
-        if(note.type==='correction'){el.style.width=(note.w*100)+'%';el.style.background=note.bg||'transparent';}
+        if(note.type==='correction'){el.style.width=(note.w*100)+'%';el.style.background='transparent';}
       } else { el.style.width=(note.width*100)+'%';const img=document.createElement('img');img.src=note.src;img.alt='Imagem inserida';el.append(img); }
       el.addEventListener('pointerdown',e=>startDrag(e,note,el));layer.append(el);
       if(note.type!=='image')el.addEventListener('dblclick',e=>{e.stopPropagation();beginInlineEdit(note);});
@@ -169,6 +214,7 @@
     showPanel('edit');$('textInput').value=note.text||'';$('textInput').disabled=note.type==='image';
     $('fontSize').value=note.size||18;$('fontSize').disabled=note.type==='image';
     $('textColor').value=note.color||'#1c293d';$('textColor').disabled=note.type==='image';
+    $('chooseFont').disabled=note.type==='image';$('fontName').textContent=note.fontKey?(state.fonts.get(note.fontKey)?.name||'Fonte local'):'Fonte similar à original';
     $('imageWidth').value=Math.round((note.width||.35)*100);$('imageWidth').disabled=note.type!=='image';
   }
   function startDrag(e,note,el) {
@@ -194,9 +240,10 @@
     const editor=document.createElement('textarea');editor.className='inline-editor';editor.setAttribute('aria-label','Editar texto na página');
     editor.value=note.text;editor.style.left=(note.x*100)+'%';editor.style.top=(note.y*100)+'%';
     editor.style.fontSize=(effectiveSize(note)*state.zoom*1.45)+'px';editor.style.color=note.color;
-    editor.style.background=note.type==='correction'?(note.bg||'transparent'):'transparent';
-    editor.style.setProperty('--document-fg',note.color);editor.style.setProperty('--document-bg',note.type==='correction'?(note.bg||'transparent'):'transparent');
-    editor.style.fontWeight=note.font==='bold'?'700':'400';editor.style.textAlign=note.align||'left';
+    editor.style.background='transparent';
+    editor.style.setProperty('--document-fg',note.color);editor.style.setProperty('--document-bg','transparent');
+    editor.style.fontWeight=note.bold?'700':'400';editor.style.textAlign=note.align||'left';
+    editor.style.fontFamily=note.previewFamily||(note.font==='times'?'Times New Roman':note.font==='courier'?'Courier New':'Arial');
     editor.style.width=note.type==='correction'?(note.w*layer.clientWidth)+'px':Math.min(layer.clientWidth*(1-note.x),Math.max(130,el.offsetWidth+36))+'px';
     editor.style.height=Math.max(28,el.offsetHeight+6)+'px';
     editor.onpointerdown=e=>e.stopPropagation();editor.onclick=e=>e.stopPropagation();
@@ -212,7 +259,7 @@
     try {
       setHint('Abrindo PDF...');const bytes=new Uint8Array(await file.arrayBuffer());
       const pdf=await pdfjsLib.getDocument({data:bytes.slice()}).promise;
-      ++state.ocrRun;state.bytes=bytes;state.pdf=pdf;state.name=file.name;state.page=1;state.zoom=1;state.notes=[];state.committed=[];state.pending=false;state.selected=null;state.targets=[];
+      ++state.ocrRun;++state.previewRun;state.bytes=bytes;state.pdf=pdf;state.previewPdf=null;state.name=file.name;state.page=1;state.zoom=1;state.notes=[];state.committed=[];state.fonts.clear();state.pending=false;state.selected=null;state.targets=[];
       state.ocr=Array.from({length:pdf.numPages},()=>({text:'',words:[],scanned:false,ready:false}));
       $('fileName').textContent=file.name;$('emptyState').classList.add('hidden');$('documentArea').classList.remove('hidden');
       setTool('select');showPanel('ocr');updateControls();await render();
@@ -251,20 +298,49 @@
     finally{if(worker) await worker.terminate();}
   }
   function cleanPdfText(s){return String(s).replace(/[^\x20-\x7e\xa0-\xff]/g,'?');}
+  async function replaceScannedPage(doc,index,notes){
+    const source=await state.pdf.getPage(index+1),viewport=source.getViewport({scale:2});
+    const c=document.createElement('canvas');c.width=Math.ceil(viewport.width);c.height=Math.ceil(viewport.height);
+    await source.render({canvasContext:c.getContext('2d'),viewport}).promise;
+    patchScannedCanvas(c,notes);
+    const pngBytes=await (await fetch(c.toDataURL('image/png'))).arrayBuffer();
+    const old=doc.getPage(index),{width,height}=old.getSize();
+    doc.removePage(index);const page=doc.insertPage(index,[width,height]);
+    const image=await doc.embedPng(pngBytes);page.drawImage(image,{x:0,y:0,width,height});
+    c.width=0;c.height=0;
+    return page;
+  }
   async function exportPdf() {
     if(!state.pdf||state.busy)return;
     if(state.pending){toast('Clique em Aplicar alterações antes de baixar.');return;}
     state.busy=true;updateControls();setHint('Preparando o PDF...');
     try{
-      const doc=await PDFLib.PDFDocument.load(state.bytes.slice(),{ignoreEncryption:false});
+      const nativeBytes=await redactNative(state.committed);
+      const doc=await PDFLib.PDFDocument.load((nativeBytes||state.bytes).slice(),{ignoreEncryption:false});
       const font=await doc.embedFont(PDFLib.StandardFonts.Helvetica);
-      const boldFont=await doc.embedFont(PDFLib.StandardFonts.HelveticaBold);
+      const embeddedFonts=new Map();
+      const textFontFor=async note=>{
+        const key=note.fontKey||`${note.font||'helvetica'}:${!!note.bold}`;
+        if(!embeddedFonts.has(key)){
+          if(note.fontKey){
+            if(!window.fontkit)throw new Error('Fontkit não carregado');
+            doc.registerFontkit(window.fontkit);
+            const local=state.fonts.get(key);
+            if(!local)throw new Error('Fonte local não disponível');
+            embeddedFonts.set(key,await doc.embedFont(local.bytes,{subset:true}));
+          }else{
+            const family=note.font==='times'?'TimesRoman':note.font==='courier'?'Courier':'Helvetica';
+            const name=PDFLib.StandardFonts[family+(note.bold?'Bold':'')];
+            embeddedFonts.set(key,await doc.embedFont(name));
+          }
+        }
+        return embeddedFonts.get(key);
+      };
       for(let p=0;p<doc.getPageCount();p++){
-        const page=doc.getPage(p),{width:W,height:H}=page.getSize(), data=state.ocr[p];
-        if(data?.scanned&&data.modified){
-          const lines=data.text.split('\n').filter(Boolean);
-          lines.forEach((line,i)=>page.drawText(cleanPdfText(line),{x:12,y:Math.max(12,H-20-i*11),size:9,font,opacity:0,maxWidth:W-24}));
-        } else if(data?.scanned&&data.words.length){
+        const scanCorrections=state.committed.filter(n=>n.page===p+1&&n.type==='correction'&&n.sourceKey?.startsWith('scan-'));
+        const page=scanCorrections.length?await replaceScannedPage(doc,p,scanCorrections):doc.getPage(p);
+        const {width:W,height:H}=page.getSize(),data=state.ocr[p];
+        if(data?.scanned&&data.words.length){
           for(const [i,w] of data.words.entries()){
             if(state.notes.some(n=>n.page===p+1&&n.sourceKey===`scan-${i}`))continue;
             const text=cleanPdfText(w.text);if(!text.trim())continue;
@@ -274,17 +350,16 @@
         }
         for(const note of state.committed.filter(n=>n.page===p+1)){
           if(note.type==='text'||note.type==='correction'){
-            const textFont=note.font==='bold'?boldFont:font;
+            const textFont=await textFontFor(note);
             let size=clamp(+note.size||18,6,96);
             if(note.type==='correction'){
-              page.drawRectangle({x:note.x*W,y:H-(note.y+note.h)*H,width:Math.min(W-note.x*W,note.w*W+3),height:note.h*H,color:rgbColor(note.bg||'#ffffff')});
               const maxWidth=note.w*W+12;
-              const longest=Math.max(1,...note.text.split('\n').map(line=>textFont.widthOfTextAtSize(cleanPdfText(line),size)));
+              const longest=Math.max(1,...note.text.split('\n').map(line=>textFont.widthOfTextAtSize(note.fontKey?line:cleanPdfText(line),size)));
               size=clamp(size*Math.min(1,maxWidth/longest),6,size);
             }
             note.text.split('\n').forEach((line,i)=>{
               if(!line)return;
-              const cleaned=cleanPdfText(line),lineWidth=textFont.widthOfTextAtSize(cleaned,size);
+              const cleaned=note.fontKey?line:cleanPdfText(line),lineWidth=textFont.widthOfTextAtSize(cleaned,size);
               const alignOffset=note.type==='correction'?(note.align==='center'?(note.w*W-lineWidth)/2:note.align==='right'?note.w*W-lineWidth:0):0;
               page.drawText(cleaned,{x:clamp(note.x*W+alignOffset,0,W-1),y:H-note.y*H-size-i*size*1.1,size,font:textFont,color:rgbColor(note.color)});
             });
@@ -311,6 +386,7 @@
     layer.querySelector('.inline-editor')?.blur();
     state.notes=clone(state.committed);state.pending=false;state.selected=null;
     renderNotes();select(null);updateControls();refreshOcr();toast('Alterações não aplicadas descartadas.');
+    rebuildPreview().catch(error=>{console.error(error);toast('Não foi possível atualizar a prévia.');});
   }
   $('openTop').onclick=$('openEmpty').onclick=()=>$('pdfInput').click();
   $('pdfInput').onchange=e=>{openPdf(e.target.files[0]);e.target.value='';};
@@ -334,6 +410,18 @@
   $('fontSize').oninput=e=>{const n=state.notes.find(n=>n.id===state.selected);if(n){n.size=+e.target.value;renderNotes();setPending();}};
   $('textColor').oninput=e=>{const n=state.notes.find(n=>n.id===state.selected);if(n){n.color=e.target.value;renderNotes();setPending();}};
   $('imageWidth').oninput=e=>{const n=state.notes.find(n=>n.id===state.selected);if(n){n.width=+e.target.value/100;renderNotes();setPending();}};
+  $('chooseFont').onclick=()=>$('fontInput').click();
+  $('fontInput').onchange=async e=>{
+    const file=e.target.files[0];e.target.value='';const note=state.notes.find(n=>n.id===state.selected);
+    if(!file||!note||note.type==='image')return;
+    if(!/\.(ttf|otf)$/i.test(file.name)){toast('Selecione uma fonte TTF ou OTF.');return;}
+    try{
+      const bytes=new Uint8Array(await file.arrayBuffer()),key=crypto.randomUUID(),family=`pdf-studio-${key}`;
+      const face=new FontFace(family,bytes);await face.load();document.fonts.add(face);
+      state.fonts.set(key,{bytes,name:file.name});note.fontKey=key;note.previewFamily=family;note.bold=false;
+      $('fontName').textContent=file.name;renderNotes();setPending();toast('Fonte escolhida. Clique em Aplicar alterações para confirmar.');
+    }catch(error){console.error(error);toast('Não foi possível carregar essa fonte. Use um arquivo TTF ou OTF válido.');}
+  };
   $('deleteItem').onclick=()=>removeNote(state.selected);
   $('copyOcr').onclick=async()=>{try{await navigator.clipboard.writeText($('ocrText').value);toast('Texto copiado.');}catch{toast('Não foi possível copiar. Selecione o texto manualmente.');}};
   $('downloadTxt').onclick=()=>{if(!state.pdf)return toast('Abra um PDF primeiro.');const text=state.ocr.map((p,i)=>`--- Página ${i+1} ---\n${textForPage(i)}`).join('\n\n');const url=URL.createObjectURL(new Blob([text],{type:'text/plain;charset=utf-8'}));const a=document.createElement('a');a.href=url;a.download=state.name.replace(/\.pdf$/i,'')+'-ocr.txt';a.click();setTimeout(()=>URL.revokeObjectURL(url),60000);};
