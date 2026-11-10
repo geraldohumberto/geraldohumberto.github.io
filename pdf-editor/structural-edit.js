@@ -91,7 +91,7 @@ window.PDFStudioStructural=(()=>{
   function edit(mupdf,bytes,changes){
     const doc=mupdf.Document.openDocument(bytes,'application/pdf'),byStream=new Map();
     for(const change of changes){
-      if(!change.text||!change.original)throw new Error('Texto original ou novo texto vazio.');
+      if(typeof change.text!=='string'||!change.original)throw new Error('Não foi possível identificar o texto a editar.');
       if(/[\r\n]/.test(change.text))throw new Error('Esta edição original aceita somente uma linha por trecho.');
       const page=doc.loadPage(change.page-1),match=validate(page,change.original);ensureExclusive(doc,change.page-1,match);
       const replacement=encodeHex(change.text),key=match.stream.asIndirect();

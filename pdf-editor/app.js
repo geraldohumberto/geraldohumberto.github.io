@@ -2,24 +2,31 @@
 (() => {
   'use strict';
   const $ = id => document.getElementById(id);
-  const state = { bytes:null, pdf:null, previewPdf:null, previewRun:0, name:'', page:1, zoom:1, tool:'select', notes:[], committed:[], fonts:new Map(), nativeColors:new Map(), pending:false, selected:null, targets:[], ocr:[], ocrRun:0, busy:false, renderRun:0 };
+  const state = { bytes:null, pdf:null, previewPdf:null, previewRun:0, name:'', page:1, zoom:1, tool:'select', notes:[], committed:[], history:[], committedHistory:[], fonts:new Map(), nativeColors:new Map(), pending:false, selected:null, targets:[], ocr:[], ocrRun:0, busy:false, renderRun:0, renderTask:null };
   const canvas = $('pdfCanvas'), surface = $('pageSurface'), layer = $('annotationLayer');
   let mupdfPromise;
   const loadMupdf = () => mupdfPromise ||= (window.PDFStudioMuPDF?Promise.resolve(window.PDFStudioMuPDF):import('https://cdn.jsdelivr.net/npm/mupdf@1.28.1/dist/mupdf.js')).catch(e=>{mupdfPromise=null;throw e;});
-  async function rewriteNative(notes){
-    const corrections=notes.filter(n=>n.type==='correction'&&n.sourceKey?.startsWith('native-'));
-    if(!corrections.length)return null;
+  async function rewriteNative(notes, source=state.bytes){
+    const changes=notes.filter(n=>n.type==='correction'&&n.text!==n.originalText)
+      .map(n=>({page:n.page,original:n.originalText,text:n.text}));
+    if(!changes.length)return null;
     const mupdf=await loadMupdf();
-    return window.PDFStudioStructural.edit(mupdf,state.bytes,corrections.map(n=>({page:n.page,original:n.originalText,text:n.text})));
+    return window.PDFStudioStructural.edit(mupdf,source,changes);
   }
-  async function rebuildPreview(){
+  async function rebuildPreview(notes=state.notes){
     const run=++state.previewRun;
-    const bytes=await rewriteNative(state.notes);
-    if(run!==state.previewRun)return;
+    const bytes=await rewriteNative(notes);
+    if(run!==state.previewRun)return false;
     const preview=bytes?await pdfjsLib.getDocument({data:bytes.slice()}).promise:null;
-    if(run!==state.previewRun)return;
+    if(run!==state.previewRun){await preview?.destroy?.();return false;}
+    const previous=state.previewPdf;
     state.previewPdf=preview;
-    await render();
+    try{await render();}
+    finally{await previous?.destroy?.();}
+    return run===state.previewRun;
+  }
+  function refreshPreview(){
+    return rebuildPreview().catch(error=>{console.error(error);toast(error.message||'Não foi possível atualizar a prévia do PDF.');});
   }
   const toast = message => { const el=$('toast'); el.textContent=message; el.classList.add('show'); clearTimeout(toast.timer); toast.timer=setTimeout(()=>el.classList.remove('show'),3500); };
   const clone = notes => notes.map(n=>({...n}));
@@ -64,7 +71,26 @@
     }
     return [...counts].sort((a,b)=>b[1]-a[1])[0]?.[0]||null;
   }
-  function setPending(){state.pending=true;updateControls();refreshOcr();renderObjectList();}
+  function documentEdits(){
+    return state.notes.filter(note=>note.type==='correction'?note.text!==note.originalText:note.type!=='text'||note.text.trim());
+  }
+  function sameEdits(a,b){
+    return a.length===b.length&&a.every((note,i)=>{
+      const keys=Object.keys(note);
+      return keys.length===Object.keys(b[i]).length&&keys.every(key=>note[key]===b[i][key]);
+    });
+  }
+  function setPending(){
+    state.pending=!sameEdits(documentEdits(),state.committed);
+    updateControls();refreshOcr();renderObjectList();
+  }
+  function remember(before){
+    if(!sameEdits(before,documentEdits())){
+      state.history.push(before);
+      if(state.history.length>100)state.history.shift();
+    }
+    setPending();
+  }
   function effectiveSize(note){
     let size=clamp(+note.size||18,6,96);
     return size;
@@ -104,29 +130,43 @@
   function textForPage(pageIndex){
     const data=state.ocr[pageIndex];if(!data?.ready)return '';
     const replacement=key=>state.notes.find(n=>n.page===pageIndex+1&&n.type==='correction'&&(n.sourceKeys||[n.sourceKey]).includes(key));
-    if(data.nativeItems?.length)return data.nativeItems.map((t,i)=>{const n=replacement(`native-${i}`);return n?(n.sourceKey===`native-${i}`?n.text:''):t;}).join(' ').replace(/\s+/g,' ').trim();
+    const edited=state.notes.some(n=>n.page===pageIndex+1&&n.type==='correction'&&n.text!==n.originalText);
+    if(data.nativeItems?.length&&(!data.scanned||edited))return data.nativeItems.map((t,i)=>{const n=replacement(`native-${i}`);return n?(n.sourceKey===`native-${i}`?n.text:''):t;}).join(' ').replace(/\s+/g,' ').trim();
     if(data.scanned&&data.words.length)return data.words.map((w,i)=>replacement(`scan-${i}`)?.text??w.text).join(' ').trim();
     return data.text;
   }
   function refreshOcr(){if(state.pdf)$('ocrText').value=textForPage(state.page-1);}
   function renderObjectList(){
-    const list=$('objectList');list.replaceChildren();$('objectPanel').classList.toggle('hidden',!state.pdf||state.notes.length===0);
-    state.notes.forEach((note,index)=>{
+    const inserted=state.notes.filter(note=>note.type!=='correction');
+    const list=$('objectList');list.replaceChildren();$('objectPanel').classList.toggle('hidden',!state.pdf||inserted.length===0);
+    inserted.forEach((note,index)=>{
       const row=document.createElement('div');row.className='object-row';
       const choose=document.createElement('button');choose.className='object-select'+(note.id===state.selected?' active':'');
-      choose.textContent=`${note.type==='image'?'▧ Imagem':note.type==='correction'?'✎ Correção':'T Texto'} ${index+1} · p. ${note.page}`;
+      choose.textContent=`${note.type==='image'?'▧ Imagem':'T Texto'} ${index+1} · p. ${note.page}`;
       choose.onclick=async()=>{if(state.page!==note.page){state.page=note.page;await render();}select(note.id);};
       const remove=document.createElement('button');remove.className='object-remove';remove.title='Remover este elemento';remove.setAttribute('aria-label',`Remover ${choose.textContent}`);remove.textContent='✕';remove.onclick=()=>removeNote(note.id);
       row.append(choose,remove);list.append(row);
     });
   }
   function removeNote(id){
+    if(state.busy)return;
     layer.querySelector('.inline-editor')?.blur();
-    const removed=state.notes.find(n=>n.id===id),count=state.notes.length;state.notes=state.notes.filter(n=>n.id!==id);
-    if(state.notes.length===count)return;
+    finishFieldEdit();
+    const note=state.notes.find(n=>n.id===id);
+    if(!note)return;
+    const before=clone(documentEdits());
+    if(note.type==='correction'){
+      if(note.text==='')return;
+      // Keep the source reference so preview and export write an empty string
+      // to the same text operator. Only undo restores an earlier value.
+      note.text='';
+      select(null);renderNotes();remember(before);refreshPreview();
+      toast('Texto apagado. Clique em Aplicar alterações para confirmar.');
+      return;
+    }
+    state.notes=state.notes.filter(n=>n.id!==id);
     if(state.selected===id)select(null);
-    renderNotes();setPending();toast('Elemento removido. Clique em Aplicar alterações para confirmar.');
-    if(removed?.type==='correction')rebuildPreview().catch(error=>{console.error(error);toast('Não foi possível atualizar a prévia.');});
+    renderNotes();remember(before);toast('Elemento removido. Clique em Aplicar alterações para confirmar.');
   }
   const setHint = s => $('workHint').textContent=s;
   const setStatus = s => $('ocrState').textContent=s;
@@ -135,12 +175,14 @@
     $('inspectorTitle').textContent=({intro:'Comece por aqui',edit:'Editar elemento',ocr:'Texto reconhecido'})[name];
   };
   const setTool = tool => {
-    if(tool==='correct'&&state.pdf&&state.ocr[state.page-1]?.scanned){toast('Esta página é escaneada: não há texto original no PDF para editar.');return;}
+    const data=state.ocr[state.page-1];
+    if(tool==='correct'&&data?.scanned&&!data.nativeItems?.length){toast('Esta página é escaneada: não há texto original no PDF para editar.');return;}
+    layer.querySelector('.inline-editor')?.blur();
     state.tool=tool;
     document.querySelectorAll('[data-tool]').forEach(el=>el.classList.toggle('active',el.dataset.tool===tool));
     layer.classList.toggle('tool-text',tool==='text');layer.classList.toggle('tool-correct',tool==='correct');
     if(tool==='text') setHint('Clique na página para inserir texto');
-    else if(tool==='correct') setHint('Clique no texto existente para corrigir diretamente na página');
+    else if(tool==='correct') setHint('Clique no texto para editar ou apagar');
     else if(tool==='image') setHint('Selecione uma imagem para inserir');
     else setHint(state.pdf?'Arraste textos e imagens para posicionar':'Abra um PDF para começar');
     if(state.pdf) renderNotes();
@@ -154,20 +196,33 @@
     $('zoomOut').disabled=!has||state.zoom<=.55;
     $('zoomIn').disabled=!has||state.zoom>=1.75;
     $('saveTop').disabled=!has||state.pending||state.busy;
+    $('undoAction').disabled=!has||!state.history.length||state.busy;
+    $('applyTop').disabled=state.busy;
+    $('discardTop').disabled=state.busy;
     $('applyTop').classList.toggle('hidden',!has||!state.pending);
     $('discardTop').classList.toggle('hidden',!has||!state.pending);
     document.body.classList.toggle('has-document',has);
   };
   async function render() {
     if(!state.pdf) return;
-    const run=++state.renderRun, page=await state.pdf.getPage(state.page);
+    const run=++state.renderRun, previous=state.renderTask;
+    if(previous?.cancel){
+      previous.cancel();
+      await previous.promise.catch(error=>{if(error.name!=='RenderingCancelledException')throw error;});
+    }
+    if(run!==state.renderRun)return;
+    const page=await state.pdf.getPage(state.page);
     const viewport=page.getViewport({scale:1.45*state.zoom});
     if(run!==state.renderRun) return;
     canvas.width=Math.ceil(viewport.width);canvas.height=Math.ceil(viewport.height);
     surface.style.width=canvas.width+'px';surface.style.height=canvas.height+'px';
     const displayPage=state.previewPdf?await state.previewPdf.getPage(state.page):page;
     if(run!==state.renderRun)return;
-    await displayPage.render({canvasContext:canvas.getContext('2d'),viewport}).promise;
+    const task=displayPage.render({canvasContext:canvas.getContext('2d'),viewport});
+    state.renderTask=task;
+    try{await task.promise;}
+    catch(error){if(run===state.renderRun||error.name!=='RenderingCancelledException')throw error;return;}
+    finally{if(state.renderTask===task)state.renderTask=null;}
     if(run!==state.renderRun) return;
     const content=await page.getTextContent();
     if(run!==state.renderRun) return;
@@ -186,7 +241,8 @@
     updateControls();
   }
   function renderNotes() {
-    layer.replaceChildren();
+    const editing=layer.querySelector('.inline-editor');
+    for(const child of [...layer.children])if(child!==editing)child.remove();
     if(state.tool==='correct'){
       const targets=state.targets;
       for(const target of targets){
@@ -194,33 +250,60 @@
         const hit=document.createElement('div');hit.className='text-target';hit.title=`Corrigir: ${target.text}`;
         hit.style.left=(target.x*100)+'%';hit.style.top=(target.y*100)+'%';hit.style.width=(Math.min(1-target.x,target.w)*100)+'%';hit.style.height=(target.h*100)+'%';
         hit.onclick=async e=>{
-          e.stopPropagation();const style=sampleStyle(target.x,target.y,target.w,target.h);
+          e.stopPropagation();
+          if(state.busy)return;
+          const source=state.bytes,page=state.page;
+          const style=sampleStyle(target.x,target.y,target.w,target.h);
           try{
             const mupdf=await loadMupdf();
-            window.PDFStudioStructural.inspect(mupdf,state.bytes,state.page-1,target.text);
-            style.color=await originalTextColor(state.page,target.originalRects||[{x:target.x,y:target.y,w:target.w,h:target.h}])||style.color;
+            if(source!==state.bytes||page!==state.page||state.tool!=='correct')return;
+            window.PDFStudioStructural.inspect(mupdf,source,page-1,target.text);
+            style.color=await originalTextColor(page,target.originalRects||[{x:target.x,y:target.y,w:target.w,h:target.h}])||style.color;
           }catch(error){toast(error.message||'Este trecho não permite edição original segura.');return;}
+          if(source!==state.bytes||page!==state.page||state.tool!=='correct')return;
           const neighbor=state.targets.filter(t=>t!==target&&t.x>target.x+target.w*.5&&t.y<target.y+target.h+.015&&t.y+t.h>target.y-.015).sort((a,b)=>a.x-b.x)[0];
           const available=(neighbor?.x??.93)-target.x-.015;
           const width=target.originalRects?.length>1?Math.max(target.w+.025,available):Math.max(target.w+.025,.2);
-          setTool('select');const note=addNote('correction',{x:target.x,y:target.y,w:Math.min(1-target.x,width),h:target.h,text:target.text,originalText:target.text,size:clamp(target.size,6,96),sourceKey:target.key,sourceKeys:target.sourceKeys||[target.key],originalRects:target.originalRects,font:target.font,bold:target.bold,align:target.align,...style});
-          try{
-            setHint('Preparando a edição do fluxo de texto original...');
-            await rebuildPreview();beginInlineEdit(note);setHint('Edite o texto no documento e clique em Aplicar alterações');
-          }catch(error){console.error(error);state.notes=state.notes.filter(n=>n.id!==note.id);state.selected=null;renderNotes();toast(error.message||'Não foi possível editar este trecho original.');}
+          setTool('select');
+          const note=addNote('correction',{
+            x:target.x,y:target.y,w:Math.min(1-target.x,width),h:target.h,hitWidth:target.w,
+            text:target.text,originalText:target.text,size:clamp(target.size,6,96),
+            sourceKey:target.key,sourceKeys:target.sourceKeys,font:target.font,bold:target.bold,align:target.align,...style
+          });
+          await beginInlineEdit(note);
         };
         layer.append(hit);
       }
     }
     for(const note of state.notes.filter(n=>n.page===state.page)) {
+      if(note.type==='correction'){
+        if(!note.text)continue;
+        const hit=document.createElement('button');
+        hit.type='button';
+        hit.className=`text-target native-edit-target${state.selected===note.id?' selected':''}`;
+        hit.dataset.id=note.id;
+        hit.setAttribute('aria-label',`Selecionar texto do PDF: ${note.text}`);
+        hit.title='Selecione e pressione Delete para apagar. Dê dois cliques para editar.';
+        hit.style.left=(note.x*100)+'%';
+        hit.style.top=(note.y*100)+'%';
+        hit.style.width=(note.hitWidth*100)+'%';
+        hit.style.height=(note.h*100)+'%';
+        hit.onclick=e=>{
+          e.stopPropagation();select(note.id);
+          if(state.tool==='correct'){setTool('select');beginInlineEdit(note);}
+        };
+        hit.ondblclick=e=>{e.stopPropagation();if(!layer.querySelector('.inline-editor'))beginInlineEdit(note);};
+        layer.append(hit);
+        continue;
+      }
       const el=document.createElement('div');el.className=`annotation ${note.type}${state.selected===note.id?' selected':''}`;
       el.style.left=(note.x*100)+'%';el.style.top=(note.y*100)+'%';el.dataset.id=note.id;
-      if(note.type==='text'||note.type==='correction') {
-        el.textContent=note.type==='correction'&&state.previewPdf?'':note.text||'Digite aqui';el.style.fontSize=(effectiveSize(note)*state.zoom*1.45)+'px';el.style.color=note.color;
+      if(note.type==='text') {
+        el.textContent=note.text||'Digite aqui';el.style.fontSize=(effectiveSize(note)*state.zoom*1.45)+'px';el.style.color=note.color;
         el.style.setProperty('--document-fg',note.color);el.style.setProperty('--document-bg','transparent');
         el.style.fontWeight=note.bold?'700':'400';el.style.fontFamily=note.previewFamily||(note.font==='times'?'Times New Roman':note.font==='courier'?'Courier New':'Arial');el.style.textAlign=note.align||'left';
         el.style.maxWidth=`${Math.max(2,(1-note.x)*100)}%`;
-        if(note.type==='correction'){el.style.width=(note.w*100)+'%';el.style.minHeight=(Math.max(1,note.h)*canvas.height)+'px';el.style.background='transparent';el.style.overflowWrap='anywhere';}
+        if(editing?.dataset.id===note.id)el.classList.add('editing');
       } else { el.style.width=(note.width*100)+'%';const img=document.createElement('img');img.src=note.src;img.alt='Imagem inserida';el.append(img); }
       el.addEventListener('pointerdown',e=>startDrag(e,note,el));layer.append(el);
       if(note.type!=='image')el.addEventListener('dblclick',e=>{e.stopPropagation();beginInlineEdit(note);});
@@ -231,7 +314,7 @@
     state.selected=id;const note=state.notes.find(n=>n.id===id);
     // Preserve the element under the pointer while starting a drag. Rebuilding
     // the layer here would detach it before setPointerCapture can take effect.
-    layer.querySelectorAll('.annotation').forEach(el=>el.classList.toggle('selected',el.dataset.id===id));renderObjectList();
+    layer.querySelectorAll('.annotation, .native-edit-target').forEach(el=>el.classList.toggle('selected',el.dataset.id===id));renderObjectList();
     if(!note){showPanel(state.pdf?'ocr':'intro');return;}
     showPanel('edit');$('textInput').value=note.text||'';$('textInput').disabled=note.type==='image';
     $('fontSize').value=note.size||18;$('fontSize').disabled=note.type==='image'||note.type==='correction';
@@ -239,28 +322,48 @@
     $('chooseFont').disabled=note.type==='image'||note.type==='correction';$('fontName').textContent=note.type==='correction'?'Fonte original preservada':note.fontKey?(state.fonts.get(note.fontKey)?.name||'Fonte local'):'Fonte similar à original';
     $('imageWidth').value=Math.round((note.type==='correction'?note.w:note.width||.35)*100);$('imageWidth').disabled=note.type!=='image';
     $('widthLabel').textContent='LARGURA DA IMAGEM';$('widthLabel').hidden=note.type==='correction';$('imageWidth').hidden=note.type==='correction';
+    $('deleteItem').textContent=note.type==='correction'?'Apagar texto do PDF':'Remover este elemento';
+    if(note.type==='correction')$('inspectorTitle').textContent='Editar texto do PDF';
   }
   function startDrag(e,note,el) {
+    if(state.busy)return;
     e.preventDefault();e.stopPropagation();select(note.id);
-    if(note.type==='correction')return;
+    const before=clone(documentEdits());
     const rect=layer.getBoundingClientRect(), x=e.clientX, y=e.clientY, initialX=note.x, initialY=note.y;
     el.setPointerCapture(e.pointerId);
     el.onpointermove=move=>{note.x=Math.max(0,Math.min(1-el.offsetWidth/rect.width,initialX+(move.clientX-x)/rect.width));note.y=Math.max(0,Math.min(1-el.offsetHeight/rect.height,initialY+(move.clientY-y)/rect.height));el.style.left=(note.x*100)+'%';el.style.top=(note.y*100)+'%';};
-    el.onpointerup=el.onpointercancel=()=>{if(Math.abs(note.x-initialX)+Math.abs(note.y-initialY)>.001)setPending();el.onpointermove=null;el.onpointerup=null;el.onpointercancel=null;};
+    el.onpointerup=el.onpointercancel=()=>{remember(before);el.onpointermove=null;el.onpointerup=null;el.onpointercancel=null;};
   }
   function addNote(type, values={}) {
+    const before=clone(documentEdits());
     const note={id:crypto.randomUUID(),page:state.page,type,x:.12,y:.16,text:'',size:18,color:'#1c293d',width:.35,...values};
-    state.notes.push(note);renderNotes();select(note.id);setPending();
+    state.notes.push(note);renderNotes();select(note.id);remember(before);
     if(type==='image')toast('Imagem inserida. Selecione para mover ou remover; depois clique em Aplicar alterações.');
     return note;
   }
-  function beginInlineEdit(note) {
-    if(!note||note.type==='image')return;
+  async function beginInlineEdit(note) {
+    if(!note||note.type==='image'||state.busy)return;
     layer.querySelector('.inline-editor')?.blur();
-    const el=[...layer.querySelectorAll('.annotation')].find(n=>n.dataset.id===note.id);
+    finishFieldEdit();
+    select(note.id);
+    if(note.type==='correction'){
+      const source=state.bytes;
+      // Render the selected operator empty while the text field is open.
+      // This temporary preview uses the same PDF rewrite as a real deletion.
+      try{
+        const editing=state.notes.map(n=>n.id===note.id?{...n,text:''}:n);
+        if(!await rebuildPreview(editing))return;
+      }catch(error){toast(error.message||'Não foi possível abrir a edição deste trecho.');refreshPreview();return;}
+      if(source!==state.bytes)return;
+      if(state.selected!==note.id||state.page!==note.page||state.tool!=='select'||state.busy){refreshPreview();return;}
+    }
+    const el=[...layer.querySelectorAll('.annotation, .native-edit-target')].find(n=>n.dataset.id===note.id);
     if(!el)return;
-    el.classList.add('editing');select(note.id);
+    el.classList.add('editing');
+    const before=clone(documentEdits());
+    const initial=note.text;
     const editor=document.createElement('textarea');editor.className='inline-editor';editor.setAttribute('aria-label','Editar texto na página');
+    editor.dataset.id=note.id;
     editor.value=note.text;editor.style.left=(note.x*100)+'%';editor.style.top=(note.y*100)+'%';
     editor.style.fontSize=(effectiveSize(note)*state.zoom*1.45)+'px';editor.style.color=note.color;
     editor.style.background='transparent';
@@ -273,19 +376,28 @@
     editor.onpointerdown=e=>e.stopPropagation();editor.onclick=e=>e.stopPropagation();
     editor.oninput=()=>{note.text=editor.value;$('textInput').value=note.text;editor.style.fontSize=(effectiveSize(note)*state.zoom*1.45)+'px';editor.style.height=Math.max(28,editor.scrollHeight+4)+'px';setPending();};
     editor.onkeydown=e=>{if(e.key==='Escape'){note.text=initial;editor.blur();}if(e.key==='Enter'&&(e.ctrlKey||e.metaKey)){e.preventDefault();editor.blur();}};
-    const initial=note.text;
-    editor.onblur=()=>{editor.remove();if(!note.text.trim()&&note.type==='text'){state.notes=state.notes.filter(n=>n.id!==note.id);if(state.selected===note.id)state.selected=null;}renderNotes();refreshOcr();if(note.type==='correction')rebuildPreview().catch(error=>{console.error(error);toast(error.message||'Não foi possível editar o texto original.');});};
+    editor.onblur=()=>{
+      editor.remove();
+      if(!note.text.trim()&&note.type==='text')state.notes=state.notes.filter(n=>n.id!==note.id);
+      if(!note.text&&state.selected===note.id)select(null);
+      else if(state.selected===note.id)select(note.id);
+      renderNotes();remember(before);
+      if(note.type==='correction')refreshPreview();
+    };
     layer.append(editor);editor.focus();editor.select();
   }
   async function openPdf(file) {
-    if(!file) return;
+    if(!file||state.busy) return;
     if(!/\.pdf$/i.test(file.name)&&file.type!=='application/pdf'){toast('Escolha um arquivo PDF.');return;}
     try {
       setHint('Abrindo PDF...');const bytes=new Uint8Array(await file.arrayBuffer());
       const pdf=await pdfjsLib.getDocument({data:bytes.slice()}).promise;
-      ++state.ocrRun;++state.previewRun;state.bytes=bytes;state.pdf=pdf;state.previewPdf=null;state.name=file.name;state.page=1;state.zoom=1;state.notes=[];state.committed=[];state.fonts.clear();state.nativeColors.clear();state.pending=false;state.selected=null;state.targets=[];
+      layer.querySelector('.inline-editor')?.blur();
+      finishFieldEdit();
+      ++state.ocrRun;++state.previewRun;state.bytes=bytes;state.pdf=pdf;state.previewPdf=null;state.name=file.name;state.page=1;state.zoom=1;state.notes=[];state.committed=[];state.history=[];state.committedHistory=[];state.fonts.clear();state.nativeColors.clear();state.pending=false;state.selected=null;state.targets=[];
       state.ocr=Array.from({length:pdf.numPages},()=>({text:'',words:[],scanned:false,ready:false}));
       $('fileName').textContent=file.name;$('emptyState').classList.add('hidden');$('documentArea').classList.remove('hidden');
+      setStatus('Analisando páginas...');
       setTool('select');showPanel('ocr');updateControls();await render();
       toast(`PDF aberto: ${pdf.numPages} página${pdf.numPages===1?'':'s'}. OCR iniciado.`);
       startOcr(state.ocrRun);
@@ -298,9 +410,11 @@
       for(let p=1;p<=n;p++) {
         if(run!==state.ocrRun) return;
         const page=await pdf.getPage(p), content=await page.getTextContent();
-        const nativeText=content.items.map(item=>item.str).filter(Boolean).join(' ').trim();
-        if(nativeText.length>=6){state.ocr[p-1]={text:nativeText,nativeItems:content.items.map(item=>item.str||''),words:[],scanned:false,ready:true};}
-        else {
+        if(run!==state.ocrRun)return;
+        const nativeItems=content.items.map(item=>item.str||'');
+        const nativeText=nativeItems.filter(Boolean).join(' ').trim();
+        if(nativeText)state.ocr[p-1]={text:nativeText,nativeItems,words:[],scanned:false,ready:true};
+        if(nativeText.length<6){
           if(!worker){setStatus('Carregando OCR em português e inglês...');worker=await Tesseract.createWorker('por+eng',1,{logger:m=>{if(run===state.ocrRun&&m.status==='recognizing text')setStatus(`Reconhecendo página ${p}/${n} · ${Math.round(m.progress*100)}%`);}});}
           if(run!==state.ocrRun) return;
           setStatus(`Reconhecendo página ${p}/${n}...`);
@@ -310,7 +424,7 @@
           const lines=(result.data.tsv||'').trim().split('\n');
           const words=lines.slice(1).map(line=>line.split('\t')).filter(v=>v.length>=12&&v[11]?.trim()&&Number(v[10])>20).map(v=>({text:v.slice(11).join('\t'),x:+v[6]/c.width,y:+v[7]/c.height,w:+v[8]/c.width,h:+v[9]/c.height}));
           if(run!==state.ocrRun)return;
-          state.ocr[p-1]={text:result.data.text.trim(),words,scanned:true,ready:true};
+          state.ocr[p-1]={text:result.data.text.trim()||nativeText,words,nativeItems:nativeText?nativeItems:[],scanned:true,ready:true};
           c.width=0;c.height=0;
         }
         $('ocrProgress').style.width=(p/n*100)+'%';
@@ -364,7 +478,8 @@
       for(let p=0;p<doc.getPageCount();p++){
         const page=doc.getPage(p);
         const {width:W,height:H}=page.getSize(),data=state.ocr[p];
-        if(data?.scanned&&data.words.length){
+        const nativeEditOnPage=state.committed.some(n=>n.page===p+1&&n.type==='correction');
+        if(data?.scanned&&data.words.length&&!nativeEditOnPage){
           for(const [i,w] of data.words.entries()){
             if(state.notes.some(n=>n.page===p+1&&n.sourceKey===`scan-${i}`))continue;
             const text=cleanPdfText(w.text);if(!text.trim())continue;
@@ -390,57 +505,116 @@
   }
   function downloadPdf(bytes){const url=URL.createObjectURL(new Blob([bytes],{type:'application/pdf'}));const a=document.createElement('a');a.href=url;a.download=state.name.replace(/\.pdf$/i,'')+'-editado.pdf';a.click();setTimeout(()=>URL.revokeObjectURL(url),60000);}
   async function applyChanges(){
+    if(state.busy)return;
     layer.querySelector('.inline-editor')?.blur();
+    finishFieldEdit();
     if(!state.pending)return;
-    try{await rewriteNative(state.notes);}catch(error){console.error(error);toast(error.message||'Este trecho não permite edição original.');return;}
-    state.committed=clone(state.notes);state.pending=false;updateControls();refreshOcr();
-    toast('Alterações aplicadas. Confira o documento e depois baixe o PDF.');
+    const draft=clone(documentEdits());
+    const history=state.history.slice();
+    state.busy=true;updateControls();
+    try{
+      await rewriteNative(draft);
+      state.committed=draft;state.committedHistory=history;setPending();
+      toast('Alterações aplicadas. Confira o documento e depois baixe o PDF.');
+    }catch(error){console.error(error);toast(error.message||'Este trecho não permite edição original.');}
+    finally{state.busy=false;updateControls();}
   }
   function discardChanges(){
+    if(state.busy)return;
     layer.querySelector('.inline-editor')?.blur();
-    state.notes=clone(state.committed);state.pending=false;state.selected=null;
-    renderNotes();select(null);updateControls();refreshOcr();toast('Alterações não aplicadas descartadas.');
-    rebuildPreview().catch(error=>{console.error(error);toast('Não foi possível atualizar a prévia.');});
+    finishFieldEdit();
+    state.notes=clone(state.committed);state.history=state.committedHistory.slice();
+    select(null);renderNotes();setPending();refreshPreview();
+    toast('Alterações não aplicadas descartadas.');
+  }
+  function undoChange(){
+    if(state.busy)return;
+    layer.querySelector('.inline-editor')?.blur();
+    finishFieldEdit();
+    const previous=state.history.pop();
+    if(!previous)return;
+    state.notes=clone(previous);
+    select(null);renderNotes();setPending();refreshPreview();
+    toast('Última ação desfeita.');
   }
   $('openTop').onclick=$('openEmpty').onclick=()=>$('pdfInput').click();
   $('pdfInput').onchange=e=>{openPdf(e.target.files[0]);e.target.value='';};
   $('applyTop').onclick=applyChanges;$('discardTop').onclick=discardChanges;
   $('saveTop').onclick=exportPdf;
-  $('prevPage').onclick=async()=>{if(state.page>1){state.page--;select(null);await render();}};
-  $('nextPage').onclick=async()=>{if(state.page<state.pdf.numPages){state.page++;select(null);await render();}};
-  $('zoomIn').onclick=()=>{state.zoom=Math.min(1.75,Math.round((state.zoom+.15)*100)/100);render();};
-  $('zoomOut').onclick=()=>{state.zoom=Math.max(.55,Math.round((state.zoom-.15)*100)/100);render();};
+  $('undoAction').onclick=undoChange;
+  $('prevPage').onclick=async()=>{if(state.page>1){layer.querySelector('.inline-editor')?.blur();state.page--;select(null);await render();}};
+  $('nextPage').onclick=async()=>{if(state.page<state.pdf.numPages){layer.querySelector('.inline-editor')?.blur();state.page++;select(null);await render();}};
+  $('zoomIn').onclick=()=>{layer.querySelector('.inline-editor')?.blur();state.zoom=Math.min(1.75,Math.round((state.zoom+.15)*100)/100);render();};
+  $('zoomOut').onclick=()=>{layer.querySelector('.inline-editor')?.blur();state.zoom=Math.max(.55,Math.round((state.zoom-.15)*100)/100);render();};
   document.querySelectorAll('[data-tool]').forEach(b=>b.onclick=()=>{if(!state.pdf){toast('Abra um PDF primeiro.');return;}if(b.dataset.tool==='image'){$('imageInput').click();return;}setTool(b.dataset.tool);});
   $('ocrTab').onclick=()=>{showPanel('ocr');if(!state.pdf)toast('Abra um PDF para iniciar o OCR.');};
-  layer.onclick=e=>{if(e.target!==layer)return;if(state.tool==='text'){const r=layer.getBoundingClientRect();const x=(e.clientX-r.left)/r.width,y=(e.clientY-r.top)/r.height;const {color}=sampleStyle(x,y,.02,.02);setTool('select');beginInlineEdit(addNote('text',{x,y,color}));}else if(state.tool==='correct')toast('Clique diretamente em uma linha de texto para corrigir.');else select(null);};
-  $('imageInput').onchange=async e=>{const file=e.target.files[0];e.target.value='';if(!file||!state.pdf)return;
+  layer.onclick=e=>{if(e.target!==layer||state.busy)return;if(state.tool==='text'){const r=layer.getBoundingClientRect();const x=(e.clientX-r.left)/r.width,y=(e.clientY-r.top)/r.height;const {color}=sampleStyle(x,y,.02,.02);setTool('select');beginInlineEdit(addNote('text',{x,y,color}));}else if(state.tool==='correct')toast('Clique diretamente em uma linha de texto para corrigir.');else select(null);};
+  $('imageInput').onchange=async e=>{const file=e.target.files[0],source=state.bytes;e.target.value='';if(!file||!source||state.busy)return;
     if(!['image/png','image/jpeg','image/webp'].includes(file.type)){toast('Use uma imagem PNG, JPG ou WebP.');return;}
     try{let src,mime=file.type;const url=URL.createObjectURL(file);const img=new Image();img.src=url;await img.decode();
       if(file.type==='image/webp'){const c=document.createElement('canvas');c.width=img.naturalWidth;c.height=img.naturalHeight;c.getContext('2d').drawImage(img,0,0);src=c.toDataURL('image/png');mime='image/png';}else src=await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(reader.result);reader.onerror=reject;reader.readAsDataURL(file);});
-      URL.revokeObjectURL(url);addNote('image',{src,mime,width:.35});setTool('select');
+      URL.revokeObjectURL(url);
+      if(source!==state.bytes||state.busy)return;
+      addNote('image',{src,mime,width:.35});setTool('select');
     }catch(error){console.error(error);toast('Não foi possível inserir esta imagem.');}
   };
-  const refreshCorrection=n=>{if(n?.type==='correction')rebuildPreview().catch(error=>{console.error(error);toast(error.message||'Não foi possível editar o texto original.');});};
-  $('textInput').oninput=e=>{const n=state.notes.find(n=>n.id===state.selected);if(n){n.text=e.target.value;renderNotes();setPending();refreshCorrection(n);}};
-  $('fontSize').oninput=e=>{const n=state.notes.find(n=>n.id===state.selected);if(n){n.size=+e.target.value;renderNotes();setPending();refreshCorrection(n);}};
-  $('textColor').oninput=e=>{const n=state.notes.find(n=>n.id===state.selected);if(n){n.color=e.target.value;renderNotes();setPending();refreshCorrection(n);}};
-  $('imageWidth').oninput=e=>{const n=state.notes.find(n=>n.id===state.selected);if(n){if(n.type==='correction')n.w=Math.min(1-n.x,+e.target.value/100);else n.width=+e.target.value/100;renderNotes();setPending();refreshCorrection(n);}};
+  let fieldEdit=null;
+  function finishFieldEdit(){
+    if(!fieldEdit)return;
+    const {note,before}=fieldEdit;
+    fieldEdit=null;
+    if(!note.text.trim()&&note.type==='text')state.notes=state.notes.filter(n=>n.id!==note.id);
+    if(!note.text.trim()&&note.type!=='image'&&state.selected===note.id)select(null);
+    renderNotes();remember(before);
+    if(note.type==='correction')refreshPreview();
+  }
+  for(const [field,property,readValue] of [
+    ['textInput','text',value=>value],
+    ['fontSize','size',Number],
+    ['textColor','color',value=>value],
+    ['imageWidth','width',value=>Number(value)/100]
+  ]){
+    const input=$(field);
+    input.oninput=()=>{
+      const note=state.notes.find(n=>n.id===state.selected);
+      if(!note||input.disabled||state.busy)return;
+      if(fieldEdit?.input!==input||fieldEdit.note!==note){
+        finishFieldEdit();fieldEdit={input,note,before:clone(documentEdits())};
+      }
+      note[property]=readValue(input.value);
+      renderNotes();setPending();
+    };
+    input.onchange=input.onblur=finishFieldEdit;
+  }
   $('chooseFont').onclick=()=>$('fontInput').click();
   $('fontInput').onchange=async e=>{
     const file=e.target.files[0];e.target.value='';const note=state.notes.find(n=>n.id===state.selected);
-    if(!file||!note||note.type==='image')return;
+    if(!file||!note||note.type!=='text'||state.busy)return;
     if(!/\.(ttf|otf)$/i.test(file.name)){toast('Selecione uma fonte TTF ou OTF.');return;}
     try{
       const bytes=new Uint8Array(await file.arrayBuffer()),key=crypto.randomUUID(),family=`pdf-studio-${key}`;
-      const face=new FontFace(family,bytes);await face.load();document.fonts.add(face);
+      const face=new FontFace(family,bytes);await face.load();
+      if(state.busy||!state.notes.includes(note))return;
+      document.fonts.add(face);
+      const before=clone(documentEdits());
       state.fonts.set(key,{bytes,name:file.name});note.fontKey=key;note.previewFamily=family;note.bold=false;
-      $('fontName').textContent=file.name;renderNotes();setPending();refreshCorrection(note);toast('Fonte escolhida. Clique em Aplicar alterações para confirmar.');
+      if(state.selected===note.id)$('fontName').textContent=file.name;
+      renderNotes();remember(before);toast('Fonte escolhida. Clique em Aplicar alterações para confirmar.');
     }catch(error){console.error(error);toast('Não foi possível carregar essa fonte. Use um arquivo TTF ou OTF válido.');}
   };
   $('deleteItem').onclick=()=>removeNote(state.selected);
   $('copyOcr').onclick=async()=>{try{await navigator.clipboard.writeText($('ocrText').value);toast('Texto copiado.');}catch{toast('Não foi possível copiar. Selecione o texto manualmente.');}};
   $('downloadTxt').onclick=()=>{if(!state.pdf)return toast('Abra um PDF primeiro.');const text=state.ocr.map((p,i)=>`--- Página ${i+1} ---\n${textForPage(i)}`).join('\n\n');const url=URL.createObjectURL(new Blob([text],{type:'text/plain;charset=utf-8'}));const a=document.createElement('a');a.href=url;a.download=state.name.replace(/\.pdf$/i,'')+'-ocr.txt';a.click();setTimeout(()=>URL.revokeObjectURL(url),60000);};
-  document.addEventListener('keydown',e=>{if((e.key==='Delete'||e.key==='Backspace')&&state.selected&&!['INPUT','TEXTAREA'].includes(document.activeElement.tagName))$('deleteItem').click();});
+  document.addEventListener('keydown',e=>{
+    const focused=document.activeElement;
+    if(e.defaultPrevented||e.isComposing||focused?.matches('input,textarea,select')||focused?.isContentEditable)return;
+    if((e.ctrlKey||e.metaKey)&&!e.altKey&&!e.shiftKey&&e.key.toLowerCase()==='z'&&state.history.length&&!state.busy){
+      e.preventDefault();undoChange();return;
+    }
+    if(!e.ctrlKey&&!e.metaKey&&!e.altKey&&(e.key==='Delete'||e.key==='Backspace')&&state.selected){
+      e.preventDefault();removeNote(state.selected);
+    }
+  });
   let depth=0;document.addEventListener('dragenter',e=>{if([...e.dataTransfer?.types||[]].includes('Files')){e.preventDefault();depth++;$('dropOverlay').classList.remove('hidden');}});
   document.addEventListener('dragover',e=>{if([...e.dataTransfer?.types||[]].includes('Files'))e.preventDefault();});
   document.addEventListener('dragleave',e=>{e.preventDefault();if(--depth<=0){depth=0;$('dropOverlay').classList.add('hidden');}});
