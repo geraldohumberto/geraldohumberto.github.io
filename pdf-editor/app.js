@@ -8,7 +8,7 @@
   const loadMupdf = () => mupdfPromise ||= (window.PDFStudioMuPDF?Promise.resolve(window.PDFStudioMuPDF):import('https://cdn.jsdelivr.net/npm/mupdf@1.28.1/dist/mupdf.js')).catch(e=>{mupdfPromise=null;throw e;});
   async function rewriteNative(notes, source=state.bytes){
     const changes=notes.filter(n=>n.type==='correction'&&n.text!==n.originalText)
-      .map(n=>({page:n.page,original:n.originalText,text:n.text}));
+      .map(n=>({page:n.page,original:n.originalText,text:n.text,origin:n.origin}));
     if(!changes.length)return null;
     const mupdf=await loadMupdf();
     return window.PDFStudioStructural.edit(mupdf,source,changes);
@@ -95,43 +95,11 @@
     let size=clamp(+note.size||18,6,96);
     return size;
   }
-  function groupTargets(items){
-    const groups=[];
-    for(const item of items){
-      const prev=groups[groups.length-1];
-      const gap=prev?(item.x-prev.x-prev.w)*canvas.width:Infinity;
-      const sameLine=prev&&Math.abs(item.y-prev.y)*canvas.height<Math.max(3,item.size*state.zoom*.4);
-      const sameStyle=prev&&prev.font===item.font&&prev.bold===item.bold&&Math.abs(prev.size-item.size)<1.5;
-      if(sameLine&&sameStyle&&gap>=-2&&gap<Math.max(7,item.size*state.zoom*1.8)){
-        prev.text+=(gap>item.size*state.zoom*.2?' ':'')+item.text;
-        prev.w=Math.max(prev.w,item.x+item.w-prev.x);prev.h=Math.max(prev.h,item.h);
-        prev.sourceKeys.push(item.key);
-      }else groups.push({...item,sourceKeys:[item.key]});
-    }
-    groups.forEach(g=>g.align=Math.abs(g.x+g.w/2-.5)<.045?'center':'left');
-    const paragraphs=[];
-    for(const line of groups){
-      const previous=paragraphs[paragraphs.length-1];
-      const gap=previous?(line.y-previous.lastY)*canvas.height:Infinity;
-      const lineHeight=line.size*state.zoom*1.45;
-      const aligned=previous&&Math.abs(line.x-previous.x)*canvas.width<Math.max(14,lineHeight*1.4);
-      const sameStyle=previous&&line.font===previous.font&&line.bold===previous.bold&&Math.abs(line.size-previous.size)<1.5;
-      if(aligned&&sameStyle&&gap>lineHeight*.7&&gap<lineHeight*1.8&&line.align!=='center'&&previous.align!=='center'){
-        previous.text+=' '+line.text;
-        previous.sourceKeys.push(...line.sourceKeys);
-        previous.originalRects.push({x:line.x,y:line.y,w:line.w,h:line.h});
-        previous.w=Math.max(previous.w,line.x+line.w-previous.x);
-        previous.h=line.y+line.h-previous.y;
-        previous.lastY=line.y;
-      }else paragraphs.push({...line,originalRects:[{x:line.x,y:line.y,w:line.w,h:line.h}],lastY:line.y});
-    }
-    return paragraphs.map(({lastY,...p})=>p);
-  }
   function textForPage(pageIndex){
     const data=state.ocr[pageIndex];if(!data?.ready)return '';
-    const replacement=key=>state.notes.find(n=>n.page===pageIndex+1&&n.type==='correction'&&(n.sourceKeys||[n.sourceKey]).includes(key));
+    const replacement=key=>state.notes.find(n=>n.page===pageIndex+1&&n.type==='correction'&&n.sourceKey===key);
     const edited=state.notes.some(n=>n.page===pageIndex+1&&n.type==='correction'&&n.text!==n.originalText);
-    if(data.nativeItems?.length&&(!data.scanned||edited))return data.nativeItems.map((t,i)=>{const n=replacement(`native-${i}`);return n?(n.sourceKey===`native-${i}`?n.text:''):t;}).join(' ').replace(/\s+/g,' ').trim();
+    if(data.nativeItems?.length&&(!data.scanned||edited))return data.nativeItems.map((t,i)=>replacement(`native-${i}`)?.text??t).join(' ').replace(/\s+/g,' ').trim();
     if(data.scanned&&data.words.length)return data.words.map((w,i)=>replacement(`scan-${i}`)?.text??w.text).join(' ').trim();
     return data.text;
   }
@@ -226,7 +194,7 @@
     if(run!==state.renderRun) return;
     const content=await page.getTextContent();
     if(run!==state.renderRun) return;
-    state.targets=groupTargets(content.items.map((item,i)=>{
+    state.targets=content.items.map((item,i)=>{
       if(!item.str?.trim())return null;
       const t=pdfjsLib.Util.transform(viewport.transform,item.transform),px=Math.hypot(t[0],t[1]);
       if(Math.abs(t[1])>1||!px)return null;
@@ -235,8 +203,8 @@
       const family=content.styles?.[item.fontName]?.fontFamily||'';
       const font=/courier|mono/i.test(family)?'courier':/times|georgia/i.test(family)||(/serif/i.test(family)&&!/sans.serif/i.test(family))?'times':'helvetica';
       const bold=/bold|black|heavy/i.test(item.fontName+' '+family);
-      return {key:`native-${i}`,text:item.str,x,y:clamp(top/viewport.height,0,1),w,h:px*1.15/viewport.height,size:px/viewport.scale,font,bold,align:Math.abs(x+w/2-.5)<.045?'center':'left'};
-    }).filter(Boolean));
+      return {key:`native-${i}`,text:item.str,origin:item.transform.slice(4),x,y:clamp(top/viewport.height,0,1),w,h:px*1.15/viewport.height,size:px/viewport.scale,font,bold,align:Math.abs(x+w/2-.5)<.045?'center':'left'};
+    }).filter(Boolean);
     renderNotes();refreshOcr();
     updateControls();
   }
@@ -246,7 +214,7 @@
     if(state.tool==='correct'){
       const targets=state.targets;
       for(const target of targets){
-        if(state.notes.some(n=>n.page===state.page&&(n.sourceKeys||[n.sourceKey]).includes(target.key)))continue;
+        if(state.notes.some(n=>n.page===state.page&&n.sourceKey===target.key))continue;
         const hit=document.createElement('div');hit.className='text-target';hit.title=`Corrigir: ${target.text}`;
         hit.style.left=(target.x*100)+'%';hit.style.top=(target.y*100)+'%';hit.style.width=(Math.min(1-target.x,target.w)*100)+'%';hit.style.height=(target.h*100)+'%';
         hit.onclick=async e=>{
@@ -257,18 +225,16 @@
           try{
             const mupdf=await loadMupdf();
             if(source!==state.bytes||page!==state.page||state.tool!=='correct')return;
-            window.PDFStudioStructural.inspect(mupdf,source,page-1,target.text);
-            style.color=await originalTextColor(page,target.originalRects||[{x:target.x,y:target.y,w:target.w,h:target.h}])||style.color;
+            window.PDFStudioStructural.inspect(mupdf,source,page-1,target.text,target.origin);
+            style.color=await originalTextColor(page,[target])||style.color;
           }catch(error){toast(error.message||'Este trecho não permite edição original segura.');return;}
           if(source!==state.bytes||page!==state.page||state.tool!=='correct')return;
-          const neighbor=state.targets.filter(t=>t!==target&&t.x>target.x+target.w*.5&&t.y<target.y+target.h+.015&&t.y+t.h>target.y-.015).sort((a,b)=>a.x-b.x)[0];
-          const available=(neighbor?.x??.93)-target.x-.015;
-          const width=target.originalRects?.length>1?Math.max(target.w+.025,available):Math.max(target.w+.025,.2);
+          const width=Math.max(target.w+.025,.2);
           setTool('select');
           const note=addNote('correction',{
             x:target.x,y:target.y,w:Math.min(1-target.x,width),h:target.h,hitWidth:target.w,
             text:target.text,originalText:target.text,size:clamp(target.size,6,96),
-            sourceKey:target.key,sourceKeys:target.sourceKeys,font:target.font,bold:target.bold,align:target.align,...style
+            sourceKey:target.key,origin:target.origin,font:target.font,bold:target.bold,align:target.align,...style
           });
           await beginInlineEdit(note);
         };
